@@ -1,0 +1,1 @@
+{"name":"appointment-assistant","version":"1.0.0","private":true,"type":"module","scripts":{"dev":"node --experimental-sqlite server/index.js","web":"npm --prefix web run dev","build":"npm --prefix web run build","test":"node --experimental-sqlite --test tests/*.test.js","start":"node --experimental-sqlite server/index.js"},"engines":{"node":">=22.13"}}
