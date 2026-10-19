@@ -15,7 +15,7 @@ function auth(req){const cookie=req.headers.cookie?.split(';').map(x=>x.trim()).
 function requireAuth(req){const u=auth(req);if(!u)err(401,'请先登录');return u}
 function requireOwner(u){if(!['owner','platform'].includes(u.role))err(403,'权限不足')}
 function tenant(u){if(!u.merchant_id)err(403,'当前账号未关联商家');return u.merchant_id}
-function originCheck(req){const origin=req.headers.origin;if(origin){const host=req.headers.host;const expected=new URL(origin);if(expected.host!==host && !((process.env.ALLOWED_ORIGIN||'').split(',').includes(origin)))err(403,'来源不受信任')}}
+function originCheck(req){const origin=req.headers.origin;if(origin){const host=req.headers.host;const expected=new URL(origin);const devAllowed=process.env.NODE_ENV!=='production' && /^https?:\/\/(localhost|127\.0\.1):5173$/.test(origin);if(expected.host!==host && !devAllowed && !((process.env.ALLOWED_ORIGIN||'').split(',').includes(origin)))err(403,'来源不受信任')}}
 const isDate=x=>typeof x==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(x)&&!Number.isNaN(Date.parse(x+'T00:00:00Z'))&&new Date(x+'T00:00:00Z').toISOString().slice(0,10)===x;
 const tomorrow=()=>{let d=new Date();d.setUTCDate(d.getUTCDate()+1);return d.toISOString().slice(0,10)};
 function publicShop(slug){const m=db.prepare('SELECT id,slug,name,intro,address,accent FROM merchants WHERE slug=? AND active=1').get(slug);if(!m)err(404,'商家不存在');return m}
