@@ -55,7 +55,7 @@ before(async()=>{
 after(async()=>{proc?.kill(); await new Promise(r=>setTimeout(r,80));rmSync(dir,{recursive:true,force:true})});
 
 test('Migration, public listing and no personal details exposed',async()=>{
-  const h=await req('/health');assert.equal(h.data.version,'2.0.0');
+  const h=await req('/health');assert.equal(h.data.version,'2.1.0');
   const shop=await req('/public/shops/forest-photo'),services=await req('/public/shops/forest-photo/services');
   assert.equal(shop.status,200);assert.equal(shop.data.merchant.phone,undefined);assert.equal(services.data.items.length,3);
   assert.equal((await req('/admin/bookings')).status,401);
@@ -149,6 +149,110 @@ test('Reject malformed input and unsupported content types',async()=>{
   assert.equal((await req('/public/merchant-applications','POST',{business_name:'abc',desired_slug:'??',contact_email:'bad',consent:true})).status,400);
   const r=await fetch(`http://127.0.0.1:${port}/api/public/merchant-applications`,{method:'POST',body:'foo',headers:{'Content-Type':'text/plain'}});
   assert.equal(r.status,415);
+});
+
+
+test('Resources, package snapshots, concurrent teams, allocation capacity, tenant isolation',async()=>{
+  const existing=(await req('/admin/resources','GET',null,'owner')).data.items;
+  assert.equal(existing.filter(r=>r.kind==='photographer').length,1);
+  const second=await req('/admin/resources','POST',{kind:'photographer',name:'摄影师乙',capacity:1},'owner');
+  assert.equal(second.status,201,JSON.stringify(second.data));
+  const photo2=second.data.id;
+  const room1=(await req('/admin/resources','POST',{kind:'room',name:'A号影棚',capacity:1},'owner')).data.id;
+  const room2=(await req('/admin/resources','POST',{kind:'room',name:'B号影棚',capacity:1},'owner')).data.id;
+  const gear=(await req('/admin/resources','POST',{kind:'equipment',name:'柔光灯组',capacity:2},'owner')).data.id;
+  const id=(await req('/admin/services','GET',null,'owner')).data.items[0].id;
+  const newPkg=await req('/admin/packages','POST',{service_id:id,title:'影棚写真双机位',description:'团队套餐',price_cents:89900,
+    duration_minutes:60,buffer_before:30,buffer_after:30,active:true,
+    requirements:[{kind:'photographer',quantity:1},{kind:'room',quantity:1},{kind:'equipment',quantity:1}]},'owner');
+  assert.equal(newPkg.status,201,JSON.stringify(newPkg.data));const pid=newPkg.data.id;
+  const day=date2();
+  const book=async(t)=>req('/public/shops/forest-photo/bookings','POST',{service_id:id,package_id:pid,
+    preferred_date:day,preferred_time:t,contact_name:'模拟用户',contact_phone:'13800138000',consent:true});
+  const b1=await book('10:00'),b2=await book('10:00');assert.equal(b1.status,201);assert.equal(b2.status,201);
+  const all=(await req('/admin/bookings','GET',null,'owner')).data.items;
+  const x=all.find(b=>b.code===b1.data.code),y=all.find(b=>b.code===b2.data.code);
+  assert.ok(x&&y);
+  assert.equal((await req('/admin/bookings/'+x.id+'/status','PATCH',{status:'confirmed',allocations:[
+    {resource_id:existing.find(r=>r.kind==='photographer').id,quantity:1},{resource_id:room1,quantity:1},{resource_id:gear,quantity:1}
+  ]},'owner')).status,200);
+  const other=(await req('/admin/bookings/'+y.id+'/status','PATCH',{status:'confirmed',allocations:[
+    {resource_id:photo2,quantity:1},{resource_id:room2,quantity:1},{resource_id:gear,quantity:1}
+  ]},'owner'));assert.equal(other.status,200,JSON.stringify(other.data));
+  const avail=await req('/public/shops/forest-photo/availability?date='+day+'&service_id='+id+'&package_id='+pid);
+  assert.equal(avail.status,200);assert.equal(avail.data.available_slots.includes('10:00'),false);
+  assert.equal(JSON.stringify(avail.data).includes('柔光灯'),false);
+  assert.equal((await book('10:00')).status,409);
+  const pEdit=await req('/admin/packages/'+pid,'PATCH',{title:'影棚写真双机位·升级版',description:'',price_cents:99000,duration_minutes:120,
+    buffer_before:0,buffer_after:0,requirements:[{kind:'photographer',quantity:2},{kind:'room',quantity:1}]},'owner');
+  assert.equal(pEdit.status,200,JSON.stringify(pEdit.data));
+  const saved=(await req('/admin/bookings','GET',null,'owner')).data.items.find(b=>b.id===x.id);
+  assert.equal(saved.duration_minutes,60); // Existing booking retains snapshot even when package edited.
+  assert.equal(saved.package_price_cents,89900);assert.equal(saved.package_title,'影棚写真双机位');
+  assert.equal(saved.allocations.length,3);
+  assert.equal((await req('/admin/resources','GET',null,'sea')).data.items.every(r=>r.id!==photo2),true);
+  assert.equal((await req('/admin/resources','POST',{kind:'equipment',name:'拒绝操作',capacity:1},'staff')).status,401);
+  assert.equal((await req('/admin/packages','POST',{service_id:id,title:'无权',price_cents:1000,duration_minutes:60,
+    requirements:[{kind:'photographer',quantity:1}]},'sea')).status,404);
+  const calendar=(await req('/admin/resource-calendar?date='+day,'GET',null,'owner')).data;
+  assert.equal(calendar.items.filter(r=>r.kind==='equipment').length,2);
+  assert.equal((await req('/admin/resource-calendar?date='+day,'GET',null,'sea')).data.items.length,0);
+  assert.equal((await req('/admin/resource-blocks','POST',{resource_id:room1,date:day,start_time:'10:00',end_time:'11:00',reason:'维护'},'owner')).status,409);
+  assert.equal((await req('/admin/bookings/'+x.id+'/status','PATCH',{status:'cancelled'},'owner')).status,200);
+  const blocked=await req('/admin/resource-blocks','POST',{resource_id:room1,date:day,start_time:'09:30',end_time:'11:30',reason:'场地维护'},'owner');
+  assert.equal(blocked.status,201,JSON.stringify(blocked.data));
+  assert.equal((await req('/admin/resources/'+room2,'PATCH',{name:'B号影棚',capacity:1,active:false},'owner')).status,409);
+  const blocks=(await req('/admin/resource-blocks?date='+day,'GET',null,'owner')).data.items;
+  assert.equal(blocks.length,1);
+  assert.equal((await req('/admin/resource-blocks/'+blocks[0].id,'DELETE',null,'owner')).status,200);
+});
+
+test('Weekly working hours restrict only the specified resource and preserve active bookings',async()=>{
+  const me=(await req('/admin/resources','GET',null,'owner')).data.items;
+  const p=me.find(x=>x.kind==='photographer'&&x.name==='摄影师乙');
+  const weekday=new Date(date2()+'T00:00:00Z').getUTCDay();
+  const result=await req('/admin/resources/'+p.id+'/weekly-hours','PUT',{
+    hours:[{weekday,start_time:'12:00',end_time:'18:00'}]
+  },'owner');
+  assert.equal(result.status,409); // Existing 10am booking must not be invalidated.
+  const response=await req('/admin/resources/'+p.id+'/weekly-hours','GET',null,'owner');
+  assert.equal(response.status,200);assert.equal(response.data.items.length,0);
+});
+
+
+test('Release resources after cancellation, block only assigned resources, and enforce allocation ownership',async()=>{
+  const ownerResources=(await req('/admin/resources','GET',null,'owner')).data.items;
+  const ownerServices=(await req('/admin/services','GET',null,'owner')).data.items;
+  const photographer=ownerResources.find(r=>r.kind==='photographer'&&r.name==='默认摄影师');
+  const room=ownerResources.find(r=>r.kind==='room'&&r.name==='A号影棚');
+  const equipment=ownerResources.find(r=>r.kind==='equipment');
+  const pkg=(await req('/admin/packages','POST',{service_id:ownerServices[0].id,title:'资源释放验证',price_cents:10000,duration_minutes:60,
+    buffer_before:30,buffer_after:30,requirements:[{kind:'photographer',quantity:1},{kind:'room',quantity:1},{kind:'equipment',quantity:1}]},'owner'));
+  assert.equal(pkg.status,201,JSON.stringify(pkg.data));
+  const body={service_id:ownerServices[0].id,package_id:pkg.data.id,preferred_date:date2(),preferred_time:'10:00',
+    contact_name:'测试代号',contact_phone:'13800138000',consent:true};
+  const made=await req('/public/shops/forest-photo/bookings','POST',body);
+  assert.equal(made.status,201,JSON.stringify(made.data));
+  const booking=(await req('/admin/bookings','GET',null,'owner')).data.items.find(b=>b.code===made.data.code);
+  const needs=await req('/admin/bookings/'+booking.id+'/resource-needs','GET',null,'owner');
+  assert.equal(needs.status,200);assert.equal(needs.data.requirements.length,3);
+  const otherResource=(await req('/admin/resources','GET',null,'sea')).data.items[0];
+  assert.equal((await req('/admin/bookings/'+booking.id+'/status','PATCH',{status:'confirmed',allocations:[
+    {resource_id:otherResource.id,quantity:1},{resource_id:room.id,quantity:1},{resource_id:equipment.id,quantity:1}
+  ]},'owner')).status,400);
+  assert.equal((await req('/admin/bookings/'+booking.id+'/status','PATCH',{status:'confirmed',allocations:[
+    {resource_id:photographer.id,quantity:1},{resource_id:room.id,quantity:1},{resource_id:equipment.id,quantity:1}
+  ]},'owner')).status,200);
+  assert.equal((await req('/admin/resource-blocks','POST',{resource_id:photographer.id,date:date2(),start_time:'09:30',end_time:'11:30'},'owner')).status,409);
+  assert.equal((await req('/admin/bookings/'+booking.id+'/status','PATCH',{status:'cancelled'},'owner')).status,200);
+  const b=await req('/admin/resource-blocks','POST',{resource_id:photographer.id,date:date2(),start_time:'09:30',end_time:'11:30'},'owner');
+  assert.equal(b.status,201);
+  const after=await req('/public/shops/forest-photo/availability?date='+date2()+'&service_id='+ownerServices[0].id+'&package_id='+pkg.data.id);
+  assert.equal(after.status,200);assert.equal(after.data.available_slots.includes('10:00'),false);
+  const blocks=(await req('/admin/resource-blocks?date='+date2(),'GET',null,'owner')).data.items;
+  for(const block of blocks){if(block.resource_id===photographer.id){await req('/admin/resource-blocks/'+block.id,'DELETE',null,'owner')}}
+  const open=await req('/public/shops/forest-photo/availability?date='+date2()+'&service_id='+ownerServices[0].id+'&package_id='+pkg.data.id);
+  assert.equal(open.data.available_slots.includes('10:00'),true);
 });
 
 test('Logout invalidates owner session',async()=>{

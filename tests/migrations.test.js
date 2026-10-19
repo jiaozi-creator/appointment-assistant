@@ -20,8 +20,11 @@ test('Upgrades legacy unversioned SQLite schema without destroying existing reco
       {env:{...process.env,DB_PATH:file,INIT_OWNER_EMAIL:'',INIT_OWNER_PASSWORD:'',INIT_PLATFORM_EMAIL:'',INIT_PLATFORM_PASSWORD:''},encoding:'utf8'});
     assert.equal(child.status,0,child.stderr);
     const upgraded=new DatabaseSync(file);
-    assert.deepEqual(upgraded.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map(r=>r.version),['001_initial.sql','002_saas.sql']);
+    assert.deepEqual(upgraded.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map(r=>r.version),['001_initial.sql','002_saas.sql','003_resources_packages.sql']);
     assert.equal(upgraded.prepare('SELECT duration_minutes FROM bookings WHERE id=?').get('booking-old').duration_minutes,120);
+    assert.equal(upgraded.prepare('SELECT package_id FROM bookings WHERE id=?').get('booking-old').package_id,'service-old:standard');
+    assert.equal(upgraded.prepare('SELECT quantity FROM booking_requirements WHERE booking_id=?').get('booking-old').quantity,1);
+    assert.equal(upgraded.prepare('SELECT package_price_cents FROM bookings WHERE id=?').get('booking-old').package_price_cents,50000);
     assert.equal(upgraded.prepare('SELECT slug FROM merchants WHERE id=?').get('legacy-merchant').slug,'legacy-studio');
     upgraded.close();
   } finally {rmSync(dir,{recursive:true,force:true});}

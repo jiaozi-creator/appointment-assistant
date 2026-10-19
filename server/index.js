@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { db, uid, checkPassword, hashPassword, transaction } from './db.js';
+import { allocate, minute, requirementsOf, requiredResourcesForBooking, RESOURCE_KINDS } from './scheduling.js';
 
 const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -88,16 +89,31 @@ function shop(slug) {
   if (!m) err(404,'工作室不存在或已停用'); return m;
 }
 const serviceFields = 'id,title,description,price_cents,duration_minutes,image_url,active';
-function overlap(merchantId, date, start, duration, ignoreId = '') {
-  const end=timeMinutes(start)+duration;
-  return db.prepare(`SELECT id,code,preferred_time,duration_minutes FROM bookings
-      WHERE merchant_id=? AND preferred_date=? AND status IN ('confirmed','completed') AND id<>?`).all(merchantId,date,ignoreId)
-    .find(row => timeMinutes(row.preferred_time)<end && timeMinutes(row.preferred_time)+row.duration_minutes>timeMinutes(start));
-}
-function verifySlot(mid,date,time,duration,ignoreId='') {
-  if (db.prepare('SELECT 1 FROM days_off WHERE merchant_id=? AND date=?').get(mid,date)) err(409,'工作室该日暂停预约');
-  if (overlap(mid,date,time,duration,ignoreId)) err(409,'此时段已有确认预约，请选择其他时间');
-}
+const packageFields = 'id,service_id,title,description,price_cents,duration_minutes,buffer_before,buffer_after,is_default,active';
+const asInt = (n,min,max,description) => {
+  if (!Number.isInteger(n)||n<min||n>max) err(400,description);
+  return n;
+};
+const currentPackage = (mid,serviceId,packageId=null,onlyActive=true) => {
+  const clause=onlyActive?' AND active=1':'';
+  const item=packageId
+    ? db.prepare(`SELECT * FROM service_packages WHERE id=? AND merchant_id=? AND service_id=?${clause}`).get(packageId,mid,serviceId)
+    : db.prepare(`SELECT * FROM service_packages WHERE merchant_id=? AND service_id=? AND is_default=1${clause}`).get(mid,serviceId);
+  if(!item) err(400,'指定套餐不存在或已下架');
+  return item;
+};
+const rulesForPackage = id => db.prepare('SELECT kind,quantity FROM package_requirements WHERE package_id=? ORDER BY kind').all(id);
+const recordAllocations = (bookingId, allocations) => {
+  db.prepare('DELETE FROM booking_allocations WHERE booking_id=?').run(bookingId);
+  for(const allocation of allocations) db.prepare('INSERT INTO booking_allocations(booking_id,resource_id,quantity) VALUES(?,?,?)')
+    .run(bookingId,allocation.resource_id,allocation.quantity);
+};
+const validateSlot = (date,time,duration,before=0,after=0) => {
+  if(!dateOK(date)||date<shopDate(1)||date>shopDate(180)) err(400,'只能预约未来180天内的日期');
+  const minutes=timeMinutes(time);
+  if(minutes%30!==0) err(400,'时段必须以半小时为单位');
+  if(minutes-before<540||minutes+duration+after>1260) err(400,'套餐含缓冲时间，须安排在09:00–21:00内');
+};
 const roles=['owner','staff'];
 function invite(mid,email,role,actor,ttl=48*3600000) {
   if (!roles.includes(role)) err(400,'邀请角色无效');
@@ -114,7 +130,7 @@ function audit(user,action,subject,detail='') {
 async function route(req,res,url) {
   const path=url.pathname,method=req.method,ip=req.socket.remoteAddress||'unknown';
   if (!['GET','HEAD'].includes(method)) verifyOrigin(req);
-  if (method==='GET' && path==='/api/health') { db.prepare('SELECT 1').get(); return json(res,200,{ok:true,version:'2.0.0',database:'sqlite'}); }
+  if (method==='GET' && path==='/api/health') { db.prepare('SELECT 1').get(); return json(res,200,{ok:true,version:'2.1.0',database:'sqlite'}); }
 
   if (method==='POST' && path==='/api/auth/login') {
     throttle('login:'+ip,12,15*60000);
@@ -159,46 +175,78 @@ async function route(req,res,url) {
     const mid=shop(m[1]).id;
     return json(res,200,{items:db.prepare(`SELECT ${serviceFields} FROM services WHERE merchant_id=? AND active=1 ORDER BY created_at DESC`).all(mid).map(({active,...row})=>row)});
   }
+  m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/packages$/);
+  if(method==='GET'&&m) {
+    const mid=shop(m[1]).id,serviceId=required(url.searchParams.get('service_id'),80);
+    const items=db.prepare(`SELECT ${packageFields} FROM service_packages
+      WHERE merchant_id=? AND service_id=? AND active=1
+      AND service_id IN (SELECT id FROM services WHERE merchant_id=? AND active=1)
+      ORDER BY is_default DESC,created_at`).all(mid,serviceId,mid);
+    return json(res,200,{items:items.map(({active,...row})=>({...row,requirements:rulesForPackage(row.id)}))});
+  }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/days-off$/);
   if (method==='GET' && m) return json(res,200,{dates:db.prepare('SELECT date FROM days_off WHERE merchant_id=? AND date>=? ORDER BY date').all(shop(m[1]).id,shopDate(1)).map(x=>x.date)});
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/availability$/);
-  if (method==='GET' && m) {
+  if(method==='GET'&&m) {
     const mid=shop(m[1]).id,date=url.searchParams.get('date');
-    if (!dateOK(date)) err(400,'请提供有效日期');
+    if(!dateOK(date)) err(400,'请提供有效日期');
     const closed=!!db.prepare('SELECT 1 FROM days_off WHERE merchant_id=? AND date=?').get(mid,date);
-    const busy=db.prepare(`SELECT preferred_time, duration_minutes FROM bookings
-      WHERE merchant_id=? AND preferred_date=? AND status IN ('confirmed','completed') ORDER BY preferred_time`).all(mid,date);
-    return json(res,200,{closed,busy}); // Only public time intervals; no customer PII.
+    // Do not disclose resource names, assignments or customers on public endpoints.
+    const busy=db.prepare(`SELECT preferred_time,duration_minutes FROM bookings WHERE merchant_id=?
+      AND preferred_date=? AND status IN ('confirmed','completed') ORDER BY preferred_time`).all(mid,date);
+    const serviceId=url.searchParams.get('service_id');
+    let available_slots=null;
+    if(serviceId) {
+      const service=db.prepare('SELECT id FROM services WHERE merchant_id=? AND id=? AND active=1').get(mid,serviceId);
+      if(!service) err(404,'服务已下架');
+      const pack=currentPackage(mid,serviceId,url.searchParams.get('package_id'));
+      const rules=rulesForPackage(pack.id);
+      available_slots=[];
+      for(let minutes=540;minutes<=1230;minutes+=30) {
+        const slot=String(Math.floor(minutes/60)).padStart(2,'0')+':'+String(minutes%60).padStart(2,'0');
+        if(minutes-pack.buffer_before<540||minutes+pack.duration_minutes+pack.buffer_after>1260)continue;
+        try { allocate({merchantId:mid,date,time:slot,duration:pack.duration_minutes,
+          before:pack.buffer_before,after:pack.buffer_after,requirements:rules});
+          available_slots.push(slot);
+        } catch(error) { if(error.status!==409) throw error; }
+      }
+    }
+    return json(res,200,{closed,busy,available_slots});
   }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/bookings$/);
-  if (method==='POST' && m) {
+  if(method==='POST'&&m) {
     throttle('book:'+ip,18,3600000);
     const mid=shop(m[1]).id,data=await getBody(req);
-    if (data.website) err(400,'请求无效');
-    const service=db.prepare('SELECT id,duration_minutes FROM services WHERE merchant_id=? AND id=? AND active=1').get(mid,required(data.service_id,80));
-    if (!service) err(400,'服务不存在或已下架');
+    if(data.website) err(400,'请求无效');
+    const service=db.prepare('SELECT id FROM services WHERE merchant_id=? AND id=? AND active=1').get(mid,required(data.service_id,80));
+    if(!service) err(400,'服务不存在或已下架');
+    const pack=currentPackage(mid,service.id,data.package_id||null);
     const preferred_date=required(data.preferred_date,10),preferred_time=required(data.preferred_time,5);
-    if (!dateOK(preferred_date)||preferred_date<shopDate(1)||preferred_date>shopDate(180)) err(400,'只能预约未来180天内的日期');
-    const minutes=timeMinutes(preferred_time);
-    if (minutes%30!==0) err(400,'请选择半小时整点时段');
-    if (minutes<9*60 || minutes+service.duration_minutes>21*60) err(400,'请选择工作室可接受的时段（09:00–21:00）');
-    if (data.consent!==true) err(400,'请确认预约信息处理告知');
+    validateSlot(preferred_date,preferred_time,pack.duration_minutes,pack.buffer_before,pack.buffer_after);
+    if(data.consent!==true) err(400,'请确认预约信息处理告知');
     const contact_name=required(data.contact_name,40),contact_phone=required(data.contact_phone,30),note=optional(data.note,500);
-    if (!/^[+0-9()\s-]{7,25}$/.test(contact_phone)) err(400,'请填写有效联系方式');
+    if(!/^[+0-9()\s-]{7,25}$/.test(contact_phone)) err(400,'请填写有效联系方式');
     const key=req.headers['idempotency-key'];
-    if (key && (typeof key!=='string'|| !/^[a-zA-Z0-9_-]{10,100}$/.test(key))) err(400,'幂等键格式不正确');
-    const outcome=transaction(() => {
-      if (key) {
+    if(key&&(typeof key!=='string'|| !/^[a-zA-Z0-9_-]{10,100}$/.test(key))) err(400,'幂等键格式不正确');
+    const outcome=transaction(()=>{
+      if(key){
         const found=db.prepare(`SELECT b.code,b.status FROM idempotency i JOIN bookings b ON b.id=i.booking_id
           WHERE i.merchant_id=? AND i.request_key=?`).get(mid,key);
-        if (found) return {...found,already:true};
+        if(found)return {...found,already:true};
       }
-      verifySlot(mid,preferred_date,preferred_time,service.duration_minutes);
+      const rules=rulesForPackage(pack.id);
+      // Feasibility at submission; not a reservation hold. Recheck atomically on confirmation.
+      allocate({merchantId:mid,date:preferred_date,time:preferred_time,duration:pack.duration_minutes,
+        before:pack.buffer_before,after:pack.buffer_after,requirements:rules});
       const id=uid(),code='YK'+new Date().toISOString().slice(0,10).replaceAll('-','')+randomBytes(6).toString('hex').toUpperCase();
-      db.prepare(`INSERT INTO bookings (id,merchant_id,service_id,code,contact_name,contact_phone,preferred_date,
-        preferred_time,note,consent_at,duration_minutes) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(id,mid,service.id,code,contact_name,contact_phone,preferred_date,preferred_time,note,new Date().toISOString(),service.duration_minutes);
-      if (key) db.prepare('INSERT INTO idempotency(merchant_id,request_key,booking_id) VALUES(?,?,?)').run(mid,key,id);
+      db.prepare(`INSERT INTO bookings(id,merchant_id,service_id,code,contact_name,contact_phone,preferred_date,
+        preferred_time,note,consent_at,duration_minutes,package_id,buffer_before,buffer_after,package_title_snapshot,package_price_cents)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(id,mid,service.id,code,contact_name,contact_phone,preferred_date,preferred_time,note,
+          new Date().toISOString(),pack.duration_minutes,pack.id,pack.buffer_before,pack.buffer_after,pack.title,pack.price_cents);
+      for(const rule of rules)db.prepare('INSERT INTO booking_requirements(booking_id,kind,quantity) VALUES(?,?,?)')
+        .run(id,rule.kind,rule.quantity);
+      if(key)db.prepare('INSERT INTO idempotency(merchant_id,request_key,booking_id) VALUES(?,?,?)').run(mid,key,id);
       return {code,status:'pending'};
     });
     return json(res,outcome.already?200:201,{code:outcome.code,status:outcome.status,message:'预约申请已提交，等待商家确认'});
@@ -269,6 +317,7 @@ async function platformRoutes(req,res,url,user) {
         if (db.prepare('SELECT 1 FROM users WHERE email=?').get(app.contact_email)) err(409,'申请邮箱已经注册');
         merchantId=uid();
         db.prepare('INSERT INTO merchants(id,slug,name,intro) VALUES(?,?,?,?)').run(merchantId,app.desired_slug,app.business_name,'欢迎预约拍摄服务');
+        db.prepare('INSERT INTO resources(id,merchant_id,kind,name,capacity) VALUES(?,?,?,?,?)').run(uid(),merchantId,'photographer','默认摄影师',1);
         activation=invite(merchantId,app.contact_email,'owner',user.id,72*3600000);
       }
       db.prepare(`UPDATE merchant_applications SET status=?,merchant_id=?,handled_by=?,handled_at=CURRENT_TIMESTAMP WHERE id=?`)
@@ -320,12 +369,21 @@ async function merchantRoutes(req,res,url,user) {
     const params=[mid,status,status,search,'%'+search+'%','%'+search+'%','%'+search+'%'];
     const total=db.prepare('SELECT COUNT(*) AS n FROM bookings b'+where).get(...params).n;
     const items=db.prepare(`SELECT b.id,b.code,b.contact_name,b.contact_phone,b.preferred_date,b.preferred_time,
-      b.duration_minutes,b.note,b.status,b.created_at,b.updated_at,s.title AS service_title
+      b.duration_minutes,b.note,b.status,b.created_at,b.updated_at,s.title AS service_title,b.package_title_snapshot AS package_title,b.package_price_cents
       FROM bookings b JOIN services s ON s.id=b.service_id ${where} ORDER BY b.created_at DESC LIMIT 20 OFFSET ?`)
       .all(...params,(page-1)*20);
+    for(const booking of items)booking.allocations=db.prepare(`SELECT r.id AS resource_id,r.name,r.kind,a.quantity FROM booking_allocations a JOIN resources r ON r.id=a.resource_id WHERE a.booking_id=?`).all(booking.id);
     return json(res,200,{items,total,page,pageSize:20});
   }
-  let m=path.match(/^\/api\/admin\/bookings\/([\w-]+)\/status$/);
+  let m=path.match(/^\/api\/admin\/bookings\/([\w-]+)\/resource-needs$/);
+  if(method==='GET'&&m){
+    const booking=db.prepare('SELECT id,preferred_date,preferred_time,duration_minutes,buffer_before,buffer_after FROM bookings WHERE id=? AND merchant_id=?').get(m[1],mid);
+    if(!booking)err(404,'预约不存在');
+    const requirements=requiredResourcesForBooking(booking.id);
+    const resources=db.prepare('SELECT id,name,kind,capacity FROM resources WHERE merchant_id=? AND active=1 ORDER BY kind,name').all(mid);
+    return json(res,200,{booking,requirements,resources});
+  }
+  m=path.match(/^\/api\/admin\/bookings\/([\w-]+)\/status$/);
   if (method==='PATCH'&&m) {
     const data=await getBody(req),next=required(data.status,20);
     const allowed={pending:['confirmed','rejected','cancelled'],confirmed:['completed','cancelled'],completed:[],rejected:[],cancelled:[]};
@@ -333,7 +391,12 @@ async function merchantRoutes(req,res,url,user) {
       const old=db.prepare('SELECT * FROM bookings WHERE id=? AND merchant_id=?').get(m[1],mid);
       if (!old) err(404,'订单不存在');
       if (!allowed[old.status]?.includes(next)) err(409,'当前状态不能执行该操作');
-      if (next==='confirmed') verifySlot(mid,old.preferred_date,old.preferred_time,old.duration_minutes,old.id);
+      if(next==='confirmed') {
+        const selected=allocate({merchantId:mid,date:old.preferred_date,time:old.preferred_time,
+          duration:old.duration_minutes,before:old.buffer_before,after:old.buffer_after,
+          requirements:requiredResourcesForBooking(old.id),requested:data.allocations,ignoreBookingId:old.id});
+        recordAllocations(old.id,selected);
+      }
       db.prepare('UPDATE bookings SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND merchant_id=?')
         .run(next,old.id,mid);
       db.prepare('INSERT INTO events(id,booking_id,actor,action,before_value,after_value) VALUES(?,?,?,?,?,?)')
@@ -357,13 +420,169 @@ async function merchantRoutes(req,res,url,user) {
     if (image_url&&!/^https:\/\//.test(image_url)) err(400,'只支持HTTPS图片');
     if (method==='POST') {
       const newId=uid();
-      db.prepare('INSERT INTO services(id,merchant_id,title,description,price_cents,duration_minutes,image_url,active) VALUES(?,?,?,?,?,?,?,?)')
-        .run(newId,mid,title,description,price,duration,image_url,active);
+      transaction(()=>{
+        db.prepare('INSERT INTO services(id,merchant_id,title,description,price_cents,duration_minutes,image_url,active) VALUES(?,?,?,?,?,?,?,?)')
+          .run(newId,mid,title,description,price,duration,image_url,active);
+        const pid=uid();
+        db.prepare('INSERT INTO service_packages(id,merchant_id,service_id,title,description,price_cents,duration_minutes,is_default,active) VALUES(?,?,?,?,?,?,?,?,?)')
+          .run(pid,mid,newId,'标准套餐',description,price,duration,1,active);
+        db.prepare('INSERT INTO package_requirements(package_id,kind,quantity) VALUES(?,?,?)').run(pid,'photographer',1);
+      });
       return json(res,201,{id:newId});
     }
-    db.prepare('UPDATE services SET title=?,description=?,price_cents=?,duration_minutes=?,image_url=?,active=? WHERE id=? AND merchant_id=?')
-      .run(title,description,price,duration,image_url,active,id,mid);
+    transaction(()=>{
+      db.prepare('UPDATE services SET title=?,description=?,price_cents=?,duration_minutes=?,image_url=?,active=? WHERE id=? AND merchant_id=?')
+        .run(title,description,price,duration,image_url,active,id,mid);
+      db.prepare(`UPDATE service_packages SET price_cents=?,duration_minutes=?,active=?
+        WHERE service_id=? AND merchant_id=? AND is_default=1`).run(price,duration,active,id,mid);
+    });
     return json(res,200,{id});
+  }
+  // Studio resources: single photographers and multi-photographer teams use the same model.
+  if(method==='GET'&&path==='/api/admin/resources') {
+    const items=db.prepare('SELECT id,kind,name,capacity,active FROM resources WHERE merchant_id=? ORDER BY kind,name').all(mid);
+    return json(res,200,{items});
+  }
+  if(method==='POST'&&path==='/api/admin/resources') {
+    requireOwner(user);const data=await getBody(req),kind=required(data.kind,20),name=required(data.name,80);
+    if(!RESOURCE_KINDS.includes(kind))err(400,'资源类型无效');
+    const capacity=asInt(data.capacity??1,1,50,'资源容量须为1～50');
+    if(kind!=='equipment'&&capacity!==1)err(400,'摄影师及场地容量必须为1');
+    const id=uid();db.prepare('INSERT INTO resources(id,merchant_id,kind,name,capacity) VALUES(?,?,?,?,?)').run(id,mid,kind,name,capacity);
+    return json(res,201,{id});
+  }
+  m=path.match(/^\/api\/admin\/resources\/([\w:-]+)$/);
+  if(method==='PATCH'&&m) {
+    requireOwner(user);const data=await getBody(req),name=required(data.name,80);
+    const resource=db.prepare('SELECT * FROM resources WHERE id=? AND merchant_id=?').get(m[1],mid);
+    if(!resource)err(404,'资源不存在');
+    const capacity=asInt(data.capacity??resource.capacity,1,50,'资源容量须为1～50');
+    if(resource.kind!=='equipment'&&capacity!==1)err(400,'摄影师和场地容量必须为1');
+    if(typeof data.active!=='boolean')err(400,'必须指定启用状态');
+    transaction(()=>{
+      const claims=db.prepare(`SELECT b.id,b.preferred_date,b.preferred_time,b.duration_minutes,b.buffer_before,b.buffer_after,a.quantity
+        FROM booking_allocations a JOIN bookings b ON b.id=a.booking_id
+        WHERE a.resource_id=? AND b.merchant_id=? AND b.status='confirmed' AND b.preferred_date>=?`).all(resource.id,mid,shopDate());
+      if(!data.active&&claims.length)err(409,'资源仍有未来已确认预约，请先调整或取消');
+      if(data.active&&capacity<resource.capacity){
+        const dates=[...new Set(claims.map(c=>c.preferred_date))];
+        for(const date of dates){
+          const changes=[];
+          for(const c of claims.filter(x=>x.preferred_date===date)){
+            const start=minute(c.preferred_time)-c.buffer_before;
+            const end=minute(c.preferred_time)+c.duration_minutes+c.buffer_after;
+            changes.push([start,c.quantity],[end,-c.quantity]);
+          }
+          changes.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+          let occupied=0;
+          for(const [,change] of changes){occupied+=change;if(occupied>capacity)err(409,'降低容量会使现有预约超出库存');}
+        }
+      }
+      db.prepare('UPDATE resources SET name=?,capacity=?,active=? WHERE id=? AND merchant_id=?')
+        .run(name,capacity,data.active?1:0,resource.id,mid);
+    });
+    return json(res,200,{ok:true});
+  }
+  if(method==='GET'&&path==='/api/admin/resource-blocks') {
+    const date=url.searchParams.get('date');
+    if(date&&!dateOK(date))err(400,'日期不正确');
+    const items=date ? db.prepare(`SELECT b.* FROM resource_blocks b WHERE b.merchant_id=? AND b.date=? ORDER BY b.start_min`).all(mid,date)
+      : db.prepare(`SELECT b.* FROM resource_blocks b WHERE b.merchant_id=? AND b.date>=? ORDER BY b.date,b.start_min LIMIT 250`).all(mid,shopDate());
+    return json(res,200,{items});
+  }
+  if(method==='POST'&&path==='/api/admin/resource-blocks') {
+    requireOwner(user);const data=await getBody(req),resourceId=required(data.resource_id,100),date=required(data.date,10);
+    if(!dateOK(date)||date<shopDate())err(400,'不可封闭已过去的日期');
+    const start=minute(required(data.start_time,5)),end=minute(required(data.end_time,5)),reason=optional(data.reason,200);
+    if(start>=end)err(400,'结束时间必须晚于开始时间');
+    transaction(()=>{
+      const resource=db.prepare('SELECT id FROM resources WHERE id=? AND merchant_id=?').get(resourceId,mid);
+      if(!resource)err(404,'资源不存在');
+      const occupied=db.prepare(`SELECT b.preferred_time,b.duration_minutes,b.buffer_before,b.buffer_after FROM booking_allocations a
+        JOIN bookings b ON b.id=a.booking_id WHERE a.resource_id=? AND b.preferred_date=? AND b.status='confirmed'`).all(resourceId,date);
+      if(occupied.some(b=>minute(b.preferred_time)-b.buffer_before<end&&minute(b.preferred_time)+b.duration_minutes+b.buffer_after>start))err(409,'该时段存在已确认预约，不能封档');
+      db.prepare('INSERT INTO resource_blocks(id,merchant_id,resource_id,date,start_min,end_min,reason) VALUES(?,?,?,?,?,?,?)')
+        .run(uid(),mid,resourceId,date,start,end,reason);
+    });return json(res,201,{ok:true});
+  }
+  m=path.match(/^\/api\/admin\/resource-blocks\/([\w-]+)$/);
+  if(method==='DELETE'&&m){requireOwner(user);
+    const result=db.prepare('DELETE FROM resource_blocks WHERE id=? AND merchant_id=?').run(m[1],mid);
+    if(!result.changes)err(404,'封档记录不存在');return json(res,200,{ok:true});
+  }
+  m=path.match(/^\/api\/admin\/resources\/([\w:-]+)\/weekly-hours$/);
+  if(method==='GET'&&m){
+    if(!db.prepare('SELECT 1 FROM resources WHERE id=? AND merchant_id=?').get(m[1],mid))err(404,'资源不存在');
+    return json(res,200,{items:db.prepare('SELECT weekday,start_min,end_min FROM resource_weekly_hours WHERE resource_id=? ORDER BY weekday,start_min').all(m[1])});
+  }
+  if(method==='PUT'&&m) {
+    requireOwner(user);const data=await getBody(req),hours=data.hours;
+    if(!db.prepare('SELECT 1 FROM resources WHERE id=? AND merchant_id=?').get(m[1],mid))err(404,'资源不存在');
+    if(!Array.isArray(hours)||hours.length>28)err(400,'每周时段格式错误');
+    const validated=hours.map(h=>({weekday:asInt(h?.weekday,0,6,'星期无效'),start:minute(h?.start_time),end:minute(h?.end_time)}));
+    if(validated.some(h=>h.start>=h.end))err(400,'时段区间无效');
+    // Forbid overlapping weekday intervals and accidental duplicate config.
+    for(let i=0;i<validated.length;i++)for(let j=0;j<i;j++){
+      const a=validated[i],b=validated[j];if(a.weekday===b.weekday&&a.start<b.end&&b.start<a.end)err(400,'每周工作时间不能重叠');
+    }
+    transaction(()=>{
+      const claims=db.prepare(`SELECT b.preferred_date,b.preferred_time,b.duration_minutes,b.buffer_before,b.buffer_after FROM booking_allocations a
+        JOIN bookings b ON b.id=a.booking_id WHERE a.resource_id=? AND b.status='confirmed' AND b.preferred_date>=?`).all(m[1],shopDate());
+      if(validated.length){for(const claim of claims){
+        const weekday=new Date(claim.preferred_date+'T00:00:00Z').getUTCDay();
+        const start=minute(claim.preferred_time)-claim.buffer_before;
+        const end=minute(claim.preferred_time)+claim.duration_minutes+claim.buffer_after;
+        if(!validated.some(h=>h.weekday===weekday&&h.start<=start&&h.end>=end))err(409,'新营业时间会排除已确认的预约');
+      }}
+      db.prepare('DELETE FROM resource_weekly_hours WHERE resource_id=?').run(m[1]);
+      for(const h of validated)db.prepare('INSERT INTO resource_weekly_hours(resource_id,weekday,start_min,end_min) VALUES(?,?,?,?)')
+        .run(m[1],h.weekday,h.start,h.end);
+    });return json(res,200,{ok:true});
+  }
+  // Packages define bookable variants, required resource categories and preparation/cleanup buffers.
+  if(method==='GET'&&path==='/api/admin/packages') {
+    const items=db.prepare(`SELECT ${packageFields} FROM service_packages WHERE merchant_id=? ORDER BY service_id,is_default DESC,created_at`).all(mid);
+    return json(res,200,{items:items.map(x=>({...x,requirements:rulesForPackage(x.id)}))});
+  }
+  m=path.match(/^\/api\/admin\/packages(?:\/([\w:-]+))?$/);
+  if(m&&['POST','PATCH','DELETE'].includes(method)) {
+    requireOwner(user);const id=m[1];if((method==='POST')===Boolean(id))err(404,'接口不存在');
+    const old=id?db.prepare('SELECT * FROM service_packages WHERE id=? AND merchant_id=?').get(id,mid):null;
+    if(id&&!old)err(404,'套餐不存在');
+    if(method==='DELETE'){
+      if(old.is_default)err(409,'标准套餐不能删除，可以下架服务');
+      db.prepare('UPDATE service_packages SET active=0 WHERE id=? AND merchant_id=?').run(id,mid);
+      return json(res,200,{ok:true});
+    }
+    const data=await getBody(req);
+    const serviceId=id?old.service_id:required(data.service_id,80);
+    if(!db.prepare('SELECT 1 FROM services WHERE id=? AND merchant_id=?').get(serviceId,mid))err(404,'服务不存在');
+    const title=required(data.title,80),description=optional(data.description,1000);
+    const price=asInt(data.price_cents,0,100000000,'价格无效');
+    const duration=asInt(data.duration_minutes,15,720,'套餐时长无效');
+    const before=asInt(data.buffer_before??0,0,180,'准备时间无效');
+    const after=asInt(data.buffer_after??0,0,180,'收尾时间无效');
+    const active=data.active!==false?1:0, rules=requirementsOf(data.requirements);
+    const pid=id||uid();
+    transaction(()=>{
+      if(!id)db.prepare(`INSERT INTO service_packages(id,merchant_id,service_id,title,description,price_cents,duration_minutes,buffer_before,buffer_after,active)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(pid,mid,serviceId,title,description,price,duration,before,after,active);
+      else db.prepare(`UPDATE service_packages SET title=?,description=?,price_cents=?,duration_minutes=?,buffer_before=?,buffer_after=?,active=?
+        WHERE id=? AND merchant_id=?`).run(title,description,price,duration,before,after,active,pid,mid);
+      db.prepare('DELETE FROM package_requirements WHERE package_id=?').run(pid);
+      for(const rule of rules)db.prepare('INSERT INTO package_requirements(package_id,kind,quantity) VALUES(?,?,?)')
+        .run(pid,rule.kind,rule.quantity);
+    });return json(res,id?200:201,{id:pid});
+  }
+  // Day calendar: assignments and blocks only for authenticated studio staff.
+  if(method==='GET'&&path==='/api/admin/resource-calendar') {
+    const date=required(url.searchParams.get('date'),10);if(!dateOK(date))err(400,'日期无效');
+    const items=db.prepare(`SELECT b.id AS booking_id,b.code,b.preferred_time,b.duration_minutes,b.buffer_before,b.buffer_after,
+      b.status,a.resource_id,a.quantity,r.name,r.kind FROM booking_allocations a JOIN bookings b ON b.id=a.booking_id
+      JOIN resources r ON r.id=a.resource_id WHERE b.merchant_id=? AND b.preferred_date=? AND b.status IN ('confirmed','completed')
+      ORDER BY b.preferred_time,r.kind,r.name`).all(mid,date);
+    const blocks=db.prepare('SELECT resource_id,start_min,end_min,reason FROM resource_blocks WHERE merchant_id=? AND date=? ORDER BY start_min').all(mid,date);
+    return json(res,200,{items,blocks});
   }
   if (method==='GET'&&path==='/api/admin/days-off') return json(res,200,{dates:db.prepare('SELECT date FROM days_off WHERE merchant_id=? ORDER BY date').all(mid).map(x=>x.date)});
   if (method==='PUT'&&path==='/api/admin/days-off') {

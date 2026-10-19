@@ -60,11 +60,17 @@ function seedMerchant() {
     const mid = uid();
     db.prepare('INSERT INTO merchants(id,slug,name,intro,address) VALUES(?,?,?,?,?)').run(mid,'forest-photo','森屿摄影','把日常记录成值得珍藏的瞬间','线上预约 · 具体地点以商家确认为准');
     db.prepare('INSERT INTO users(id,merchant_id,email,password_hash,role) VALUES(?,?,?,?,?)').run(uid(),mid,email,hashPassword(password),'owner');
+    db.prepare('INSERT INTO resources(id,merchant_id,kind,name,capacity) VALUES(?,?,?,?,?)').run(uid(),mid,'photographer','默认摄影师',1);
     for (const [name, description, price, minutes] of [
       ['自然光个人写真','户外自然光拍摄 · 精修照片',39900,90],
       ['双人纪念写真','情侣、闺蜜及双人纪念 · 精修照片',59900,120],
       ['毕业纪念照','毕业纪念 · 个性化拍摄安排',49900,120]
-    ]) db.prepare('INSERT INTO services(id,merchant_id,title,description,price_cents,duration_minutes) VALUES(?,?,?,?,?,?)').run(uid(),mid,name,description,price,minutes);
+    ]) {
+      const serviceId=uid(),packageId=uid();
+      db.prepare('INSERT INTO services(id,merchant_id,title,description,price_cents,duration_minutes) VALUES(?,?,?,?,?,?)').run(serviceId,mid,name,description,price,minutes);
+      db.prepare('INSERT INTO service_packages(id,merchant_id,service_id,title,description,price_cents,duration_minutes,is_default) VALUES(?,?,?,?,?,?,?,1)').run(packageId,mid,serviceId,'标准套餐',description,price,minutes);
+      db.prepare('INSERT INTO package_requirements(package_id,kind,quantity) VALUES(?,?,1)').run(packageId,'photographer');
+    }
   });
   console.log('[bootstrap] demo merchant forest-photo initialized');
 }
