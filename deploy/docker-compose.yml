@@ -1,0 +1,25 @@
+services:
+  appointment:
+    build: ..
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+      DB_PATH: /app/data/appointment.sqlite
+      COOKIE_SECURE: "1"
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:?Set HTTPS allowed origin}
+      INIT_PLATFORM_EMAIL: ${INIT_PLATFORM_EMAIL:?Set first platform email}
+      INIT_PLATFORM_PASSWORD: ${INIT_PLATFORM_PASSWORD:?Set long first platform password}
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - appointment_data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+volumes:
+  appointment_data:
