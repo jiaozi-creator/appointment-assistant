@@ -1,31 +1,35 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {DatabaseSync} from 'node:sqlite';
-import {spawnSync} from 'node:child_process';
-import {readFileSync,mkdtempSync,rmSync} from 'node:fs';
-import {join} from 'node:path';
-import {tmpdir} from 'node:os';
+import pg from 'pg';
+import { spawn } from 'node:child_process';
+import { createDatabase, dropDatabase } from './pg-setup.js';
 
-test('Upgrades legacy unversioned SQLite schema without destroying existing records',()=>{
-  const dir=mkdtempSync(join(tmpdir(),'legacy-appointment-'));
+function boot(url) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['tests/boot-db.js'], {
+      env: { ...process.env, DATABASE_URL: url, INIT_OWNER_EMAIL: '', INIT_OWNER_PASSWORD: '', INIT_PLATFORM_EMAIL: '', INIT_PLATFORM_PASSWORD: '' }
+    });
+    let err = '';
+    child.stderr.on('data', chunk => { err += chunk; });
+    child.on('exit', code => code === 0 ? resolve() : reject(new Error(err || `exit ${code}`)));
+  });
+}
+
+test('Postgres schema migration applies once and keeps an empty shop', async () => {
+  const url = await createDatabase();
+  const client = new pg.Client({ connectionString: url });
   try {
-    const file=join(dir,'legacy.sqlite');
-    const db=new DatabaseSync(file);db.exec(readFileSync('server/migrations/001_initial.sql','utf8'));
-    db.prepare('INSERT INTO merchants(id,slug,name) VALUES (?,?,?)').run('legacy-merchant','legacy-studio','旧版工作室');
-    db.prepare('INSERT INTO services(id,merchant_id,title,price_cents,duration_minutes) VALUES (?,?,?,?,?)').run('service-old','legacy-merchant','旧服务',50000,120);
-    db.prepare(`INSERT INTO bookings(id,merchant_id,service_id,code,contact_name,contact_phone,preferred_date,preferred_time,consent_at)
-      VALUES(?,?,?,?,?,?,?,?,?)`).run('booking-old','legacy-merchant','service-old','YK-LEGACY','旧模拟客户','13800138000','2027-01-01','10:00','2026-10-01');
-    db.close();
-    const child=spawnSync(process.execPath,['--experimental-sqlite','--input-type=module','-e',"import('./server/db.js')"],
-      {env:{...process.env,DB_PATH:file,INIT_OWNER_EMAIL:'',INIT_OWNER_PASSWORD:'',INIT_PLATFORM_EMAIL:'',INIT_PLATFORM_PASSWORD:''},encoding:'utf8'});
-    assert.equal(child.status,0,child.stderr);
-    const upgraded=new DatabaseSync(file);
-    assert.deepEqual(upgraded.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map(r=>r.version),['001_initial.sql','002_saas.sql','003_resources_packages.sql']);
-    assert.equal(upgraded.prepare('SELECT duration_minutes FROM bookings WHERE id=?').get('booking-old').duration_minutes,120);
-    assert.equal(upgraded.prepare('SELECT package_id FROM bookings WHERE id=?').get('booking-old').package_id,'service-old:standard');
-    assert.equal(upgraded.prepare('SELECT quantity FROM booking_requirements WHERE booking_id=?').get('booking-old').quantity,1);
-    assert.equal(upgraded.prepare('SELECT package_price_cents FROM bookings WHERE id=?').get('booking-old').package_price_cents,50000);
-    assert.equal(upgraded.prepare('SELECT slug FROM merchants WHERE id=?').get('legacy-merchant').slug,'legacy-studio');
-    upgraded.close();
-  } finally {rmSync(dir,{recursive:true,force:true});}
+    await boot(url);
+    await boot(url);
+    await client.connect();
+    const versions = await client.query('SELECT version FROM schema_migrations ORDER BY version');
+    assert.deepEqual(versions.rows.map(row => row.version), ['001_postgres.sql']);
+    const merchants = await client.query('SELECT COUNT(*)::int AS n FROM merchants');
+    assert.equal(merchants.rows[0].n, 0);
+    const zone = await client.query("SELECT column_default FROM information_schema.columns WHERE table_name='merchants' AND column_name='time_zone'");
+    assert.match(zone.rows[0].column_default, /Asia\/Shanghai/);
+  } finally {
+    await client.end().catch(() => {});
+    await dropDatabase(url);
+  }
 });

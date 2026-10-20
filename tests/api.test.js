@@ -1,12 +1,10 @@
 import test, {before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {mkdtempSync,rmSync} from 'node:fs';
-import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {createDatabase,dropDatabase} from './pg-setup.js';
 
-const dir=mkdtempSync(join(tmpdir(),'appointment-saas-'));
 const port=30000+Math.floor(Math.random()*20000);
+let databaseUrl;
 let proc;
 const accounts={};
 const date=()=>new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(Date.now()+10*86400000));
@@ -35,14 +33,15 @@ async function apply(name,slug,email) {
 }
 async function publicBook(slug,serviceId,day,slot='10:00',key='') {
   return req(`/public/shops/${slug}/bookings`,'POST',{
-    service_id:serviceId,preferred_date:day,preferred_time:slot,contact_name:'虚拟客户',contact_phone:'13800138000',consent:true
+    service_id:serviceId,preferred_date:day,preferred_time:slot,contact_name:'虚拟客户',contact_phone:'13800138000',contact_email:'guest@example.test',consent:true
   },null,key?{'Idempotency-Key':key}:{});
 }
 
 before(async()=>{
-  proc=spawn(process.execPath,['--experimental-sqlite','server/index.js'],{
+  databaseUrl=await createDatabase();
+  proc=spawn(process.execPath,['server/index.js'],{
     cwd:process.cwd(),env:{...process.env,NODE_ENV:'test',PORT:String(port),HOST:'127.0.0.1',
-      DB_PATH:join(dir,'test.sqlite'),INIT_OWNER_EMAIL:'owner@example.test',INIT_OWNER_PASSWORD:'strong-password-for-test',
+      DATABASE_URL:databaseUrl,INIT_OWNER_EMAIL:'owner@example.test',INIT_OWNER_PASSWORD:'strong-password-for-test',
       INIT_PLATFORM_EMAIL:'platform@example.test',INIT_PLATFORM_PASSWORD:'strong-platform-password-test'}
   });
   let ready=false;
@@ -52,10 +51,10 @@ before(async()=>{
   }
   assert.ok(ready,'server must become healthy');
 });
-after(async()=>{proc?.kill(); await new Promise(r=>setTimeout(r,80));rmSync(dir,{recursive:true,force:true})});
+after(async()=>{proc?.kill(); await new Promise(r=>setTimeout(r,300)); if(databaseUrl) await dropDatabase(databaseUrl);});
 
 test('Migration, public listing and no personal details exposed',async()=>{
-  const h=await req('/health');assert.equal(h.data.version,'2.1.0');
+  const h=await req('/health');assert.equal(h.data.version,'2.3.0');assert.equal(h.data.database,'postgres');
   const shop=await req('/public/shops/forest-photo'),services=await req('/public/shops/forest-photo/services');
   assert.equal(shop.status,200);assert.equal(shop.data.merchant.phone,undefined);assert.equal(services.data.items.length,3);
   assert.equal((await req('/admin/bookings')).status,401);
@@ -170,7 +169,7 @@ test('Resources, package snapshots, concurrent teams, allocation capacity, tenan
   assert.equal(newPkg.status,201,JSON.stringify(newPkg.data));const pid=newPkg.data.id;
   const day=date2();
   const book=async(t)=>req('/public/shops/forest-photo/bookings','POST',{service_id:id,package_id:pid,
-    preferred_date:day,preferred_time:t,contact_name:'模拟用户',contact_phone:'13800138000',consent:true});
+    preferred_date:day,preferred_time:t,contact_name:'模拟用户',contact_phone:'13800138000',contact_email:'guest@example.test',consent:true});
   const b1=await book('10:00'),b2=await book('10:00');assert.equal(b1.status,201);assert.equal(b2.status,201);
   const all=(await req('/admin/bookings','GET',null,'owner')).data.items;
   const x=all.find(b=>b.code===b1.data.code),y=all.find(b=>b.code===b2.data.code);
@@ -243,7 +242,7 @@ test('Release resources after cancellation, block only assigned resources, and e
     buffer_before:30,buffer_after:30,requirements:[{kind:'photographer',quantity:1},{kind:'room',quantity:1},{kind:'equipment',quantity:1}]},'owner'));
   assert.equal(pkg.status,201,JSON.stringify(pkg.data));
   const body={service_id:ownerServices[0].id,package_id:pkg.data.id,preferred_date:date2(),preferred_time:'10:00',
-    contact_name:'测试代号',contact_phone:'13800138000',consent:true};
+    contact_name:'测试代号',contact_phone:'13800138000',contact_email:'guest@example.test',consent:true};
   const made=await req('/public/shops/forest-photo/bookings','POST',body);
   assert.equal(made.status,201,JSON.stringify(made.data));
   const booking=(await req('/admin/bookings','GET',null,'owner')).data.items.find(b=>b.code===made.data.code);
@@ -273,7 +272,7 @@ test('Booking lookup hides contact details, and merchant sees the customer note'
   const day=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(Date.now()+40*86400000));
   const made=await req('/public/shops/forest-photo/bookings','POST',{
     service_id:services[0].id,preferred_date:day,preferred_time:'11:00',contact_name:'窗边客户',contact_phone:'13800138000',
-    note:'希望安排窗边',consent:true
+    contact_email:'window@example.test',note:'希望安排窗边',consent:true
   });
   assert.equal(made.status,201,JSON.stringify(made.data));
   const listed=(await req('/admin/bookings?q='+made.data.code,'GET',null,'owner')).data.items.find(b=>b.code===made.data.code);
@@ -291,11 +290,14 @@ test('Booking lookup hides contact details, and merchant sees the customer note'
   assert.equal(body.includes('13800138000'),false);
   assert.equal(body.includes('窗边客户'),false);
   assert.equal(body.includes('希望安排窗边'),false);
+  assert.equal(body.includes('window@example.test'),false);
+  assert.equal(lookup.data.booking.time_zone,'Asia/Shanghai');
+  assert.equal(lookup.data.booking.payment_status,'unpaid');
   assert.equal((await req('/public/shops/sea-photo/bookings/'+made.data.code)).status,404);
   assert.equal((await req('/public/shops/forest-photo/bookings/YKDOESNOTEXIST1234')).status,404);
   assert.equal((await req('/admin/days-off','PUT',{dates:[day]},'owner')).status,200);
   const blocked=await req('/public/shops/forest-photo/bookings','POST',{
-    service_id:services[0].id,preferred_date:day,preferred_time:'16:00',contact_name:'另一客户',contact_phone:'13800138000',consent:true
+    service_id:services[0].id,preferred_date:day,preferred_time:'16:00',contact_name:'另一客户',contact_phone:'13800138000',contact_email:'guest@example.test',consent:true
   });
   assert.equal(blocked.status,409);
   assert.match(blocked.data.error,/暂停/);

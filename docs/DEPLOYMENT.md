@@ -2,9 +2,9 @@
 
 ## 部署拓扑
 
-当前实现：**一个 Node.js 进程 + 一个持久化 SQLite 数据库文件 + Vue 静态构建**。数据库包含所有商户，以 `merchant_id` 在服务端隔离。适合本地测试与小规模**受控试点**；**不是**高可用 PostgreSQL 多节点 SaaS。
+当前实现：**一个或多个 Node.js 进程 + 一个共享 PostgreSQL 数据库 + Vue 静态构建**。数据库包含所有商户，以 `merchant_id` 在服务端隔离。适合受控试点；数据库本身仍是单实例，不是多主复制。
 
-建议：域名解析 → HTTPS 反向代理（示例 `deploy/Caddyfile.example`）→ Docker 容器 `127.0.0.1:3001` → SQLite 持久化卷。严禁直接公网暴露 HTTP 3001 端口。
+建议：域名解析 → HTTPS 反向代理（示例 `deploy/Caddyfile.example`）→ API 容器 `127.0.0.1:3001` → PostgreSQL。严禁直接公网暴露 HTTP 3001 端口和数据库端口。
 
 ## 部署前必须完成
 
@@ -28,19 +28,19 @@ curl http://127.0.0.1:3001/api/health
 
 ## 数据迁移
 
-`server/migrations/001_initial.sql` 建立初始数据表；`002_saas.sql` 在V1基础上升级商家申请、成员邀请、审计、预约服务时长快照和索引。数据库启动时由 `schema_migrations` 记录版本并在事务中按顺序执行；旧版尚无此表时会自动将原始Schema标记为已执行001，再执行002。**真实数据升级前必须备份并在副本演练**，不可将回滚理解为自动降级SQL。
+当前库结构在 `server/migrations-pg/001_postgres.sql`。启动时写入 `schema_migrations`，同一版本只执行一次。`server/migrations/` 里的 SQLite 文件不再运行。**真实数据升级前必须备份并在副本演练**。
 
-数据库安全扩展建议：采用 PostgreSQL（可以使用行级策略作为额外防线），应用层保留 `merchant_id` 权限校验；未来需要实现迁移工具、回填、逐表校验、双写或停机切换，不可以直接替换SQLite连接字符串。目前尚未实现 PostgreSQL 适配器。
+持久化已经是 PostgreSQL。应用层仍按 `merchant_id` 校验，不依赖数据库行级策略。旧 SQLite 文件不会自动导入。
 
 ## 备份与恢复
 
-SQLite WAL 模式不应在进程运行时直接裸复制 `appointment.sqlite`，否则可能漏掉 WAL 文件中的已提交事务。提供一致性快照工具：
+备份使用 `pg_dump`：
 
 ```bash
-DB_PATH=./data/appointment.sqlite node --experimental-sqlite scripts/backup.js
+DATABASE_URL=postgres://appointment:appointment@127.0.0.1:5432/appointment node scripts/backup.js
 ```
 
-工具使用 SQLite `VACUUM INTO` 产生只读一致性快照文件，权限设为600。容器内如需备份，应进入容器或将容器卷文件在专用维护任务中读出；**必须将备份加密复制到另一存储介质**，并定期测试恢复。不能只备份到同一个 Docker 卷。
+工具写出 custom 格式备份，权限设为 600。**必须将备份加密复制到另一存储介质**，并定期测试恢复。不能只备份到同一个数据库卷。
 
 恢复演练：停止服务、妥善保留现有库及 WAL/SHM 文件、恢复备份至数据文件、确保未混入旧 WAL、重启并核对迁移和业务数据。任何真实恢复都应有审批及记录。
 
@@ -49,8 +49,8 @@ DB_PATH=./data/appointment.sqlite node --experimental-sqlite scripts/backup.js
 - 前端依赖安装及 `vite build` 尚需在联网CI / 开发机真正运行验证。
 - 自动证书签发、域名备案、云主机订购未执行。
 - 用户隐私政策、数据访问日志与个人信息删除/导出工单流程尚需实现与法律核查。
-- 短信/邮件通知、企业微信集成、支付和跨时区排期尚未实现。摄影师、场地与设备的并发容量已实现：同一时段可以确认多笔互不冲突的预约；自动分配仍按名称做确定性选择。
-- SQLite 单实例写入，进程内限流，尚无分布式锁、集中式限流与多副本部署支持。
+- 邮件（SMTP）和阿里云短信在配置密钥后走真实通道；未配置时写入可查询的测试投递。微信支付在配置商户私钥后创建 Native 订单，未配置时测试支付立即记为已支付。企业微信未做。
+- 自动分配按该时段剩余容量、当天已确认负荷和资源编号选择，不按名称。多个 API 进程用 PostgreSQL 咨询锁保护同一天的确认。限流仍在进程内存里，不是集中式限流。
 - 尚未完成第三方渗透测试、故障恢复演练、真实用户/真实商家部署试点。
 
 **严格上线门槛：不得仅因API测试和页面构建成功就接收真实客户资料。**

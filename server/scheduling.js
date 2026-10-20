@@ -1,5 +1,5 @@
-// Central reservation resource engine. All writes using this function MUST occur inside BEGIN IMMEDIATE.
-// SQLite serializes writers; PostgreSQL migration will require locking/transactional exclusion guarantees.
+// Resource engine. Callers that persist a decision must already be inside a transaction.
+// allocate() takes a transaction-scoped advisory lock on merchant+date so two processes cannot confirm the same capacity.
 import { db } from './db.js';
 
 export const RESOURCE_KINDS = ['photographer','room','equipment'];
@@ -61,11 +61,18 @@ export function freeAt(resource, date, booking, ignoreBookingId='') {
   const {start,end}=bookingWindow(booking);
   return freeCapacity(resource, date, start, end, ignoreBookingId);
 }
+function sameDayLoad(resourceId, date, ignoreBookingId) {
+  return db.prepare(`SELECT COALESCE(SUM(a.quantity),0) AS total
+    FROM booking_allocations a JOIN bookings b ON b.id=a.booking_id
+    WHERE a.resource_id=? AND b.preferred_date=? AND b.status IN ('confirmed','completed') AND b.id<>?`)
+    .get(resourceId, date, ignoreBookingId).total;
+}
 export function allocate({merchantId,date,time,duration,before=0,after=0,requirements,requested,ignoreBookingId=''}) {
+  db.prepare('SELECT pg_advisory_xact_lock(hashtext(?)::bigint)').get(`${merchantId}:${date}`);
   const {start,end}=bookingWindow({preferred_time:time,duration_minutes:duration,buffer_before:before,buffer_after:after});
   if (db.prepare('SELECT 1 FROM days_off WHERE merchant_id=? AND date=?').get(merchantId,date)) fail(409,'工作室该日暂停预约');
   if (start<9*60||end>21*60) fail(409,'该套餐的拍摄、准备和收尾时间必须在09:00–21:00内');
-  const resources=db.prepare('SELECT id,kind,name,capacity,active FROM resources WHERE merchant_id=? ORDER BY kind,name,id').all(merchantId);
+  const resources=db.prepare('SELECT id,kind,name,capacity,active FROM resources WHERE merchant_id=? ORDER BY kind,id').all(merchantId);
   if (requested !== undefined && requested !== null) {
     if (!Array.isArray(requested)||requested.length>60) fail(400,'资源分配格式无效');
     const selections=[],totals=new Map(),seen=new Set();
@@ -84,10 +91,14 @@ export function allocate({merchantId,date,time,duration,before=0,after=0,require
   const selected=[];
   for (const rule of requirements) {
     let remaining=rule.quantity;
-    for (const resource of resources.filter(x=>x.kind===rule.kind&&x.active)) {
-      const available=freeCapacity(resource,date,start,end,ignoreBookingId);
-      const take=Math.min(available,remaining);
-      if (take>0) {selected.push({resource_id:resource.id,kind:resource.kind,quantity:take,name:resource.name});remaining-=take;}
+    const pool=resources.filter(x=>x.kind===rule.kind&&x.active).map(resource=>({
+      resource,
+      available:freeCapacity(resource,date,start,end,ignoreBookingId),
+      load:sameDayLoad(resource.id,date,ignoreBookingId)
+    })).sort((a,b)=>b.available-a.available||a.load-b.load||(a.resource.id<b.resource.id?-1:a.resource.id>b.resource.id?1:0));
+    for (const item of pool) {
+      const take=Math.min(item.available,remaining);
+      if (take>0) {selected.push({resource_id:item.resource.id,kind:item.resource.kind,quantity:take,name:item.resource.name});remaining-=take;}
       if (!remaining) break;
     }
     if (remaining) fail(409,`该时段${{photographer:'摄影师',room:'场地',equipment:'设备'}[rule.kind]}资源不足，请选择其他时段`);

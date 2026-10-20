@@ -4,6 +4,9 @@ import { resolve, extname } from 'node:path';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { db, uid, checkPassword, hashPassword, transaction } from './db.js';
 import { allocate, minute, requirementsOf, requiredResourcesForBooking, RESOURCE_KINDS, freeAt } from './scheduling.js';
+import { localToUtcMs, zoneLabel, zoneOk, zonedDate } from './time.js';
+import { notifyBooking } from './notify.js';
+import { payBooking, refundBooking, refundRemote } from './payments.js';
 
 const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -31,11 +34,9 @@ const digest = value => createHash('sha256').update(value).digest('hex');
 const emailOf = value => { const email = required(value, 180).toLowerCase(); if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) err(400, '邮箱格式不正确'); return email; };
 const slugOf = value => { const slug = required(value, 60).toLowerCase(); if (!/^[a-z0-9][a-z0-9-]{2,59}$/.test(slug)) err(400,'商家标识只能为3-60位小写字母、数字和连字符'); return slug; };
 const dateOK = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value + 'T00:00:00Z')) && new Date(value + 'T00:00:00Z').toISOString().slice(0,10) === value;
-// Dates/times represent a shop-local wall clock. MVP shops use the Asia/Shanghai timezone.
-const shopDate = (offsetDays = 0) => {
-  const now = new Date(Date.now() + offsetDays * 86400000);
-  return new Intl.DateTimeFormat('sv-SE',{ timeZone: 'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit' }).format(now);
-};
+function merchantZone(mid) {
+  return db.prepare('SELECT time_zone FROM merchants WHERE id=?').get(mid)?.time_zone || 'Asia/Shanghai';
+}
 const timeMinutes = text => { try { return minute(text); } catch (e) { if (e.status===400) err(400,'时间格式不正确'); throw e; } };
 const rate = new Map();
 function throttle(key, max, windowMs) {
@@ -85,7 +86,7 @@ function cookiesFor(token,csrfToken) {
 }
 function clearCookies() { return ['aa_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'+(secure?'; Secure':''), 'aa_csrf=; SameSite=Lax; Path=/; Max-Age=0'+(secure?'; Secure':'')]; }
 function shop(slug) {
-  const m = db.prepare('SELECT id,slug,name,intro,address,accent,active FROM merchants WHERE slug=? AND active=1').get(slug);
+  const m = db.prepare('SELECT id,slug,name,intro,address,accent,active,time_zone FROM merchants WHERE slug=? AND active=1').get(slug);
   if (!m) err(404,'工作室不存在或已停用'); return m;
 }
 const serviceFields = 'id,title,description,price_cents,duration_minutes,image_url,active';
@@ -108,12 +109,33 @@ const recordAllocations = (bookingId, allocations) => {
   for(const allocation of allocations) db.prepare('INSERT INTO booking_allocations(booking_id,resource_id,quantity) VALUES(?,?,?)')
     .run(bookingId,allocation.resource_id,allocation.quantity);
 };
-const validateSlot = (date,time,duration,before=0,after=0) => {
-  if(!dateOK(date)||date<shopDate(1)||date>shopDate(180)) err(400,'只能预约未来180天内的日期');
+const validateSlot = (date,time,duration,before=0,after=0,timeZone='Asia/Shanghai') => {
+  if(!dateOK(date)||date<zonedDate(timeZone,1)||date>zonedDate(timeZone,180)) err(400,'只能预约未来180天内的日期');
   const minutes=timeMinutes(time);
   if(minutes%30!==0) err(400,'时段必须以半小时为单位');
   if(minutes-before<540||minutes+duration+after>1260) err(400,'套餐含缓冲时间，须安排在09:00–21:00内');
 };
+function publicBooking(slug, code) {
+  const studio=shop(slug);
+  const normalized=String(code||'').toUpperCase();
+  if (!/^YK[A-Z0-9]+$/.test(normalized)) err(400,'预约编号格式不正确');
+  const row=db.prepare(`SELECT b.*, m.name AS merchant_name FROM bookings b JOIN merchants m ON m.id=b.merchant_id
+    WHERE b.merchant_id=? AND b.code=?`).get(studio.id, normalized);
+  if (!row) err(404,'没有找到对应的预约申请');
+  return row;
+}
+function assertPhone(booking, data) {
+  const phone=required(data.contact_phone,30);
+  if (phone!==booking.contact_phone) err(403,'联系电话与预约不一致');
+}
+function bookingView(row) {
+  return {
+    code:row.code, status:row.status, preferred_date:row.preferred_date, preferred_time:row.preferred_time,
+    duration_minutes:row.duration_minutes, package_title:row.package_title, package_price_cents:row.package_price_cents,
+    payment_status:row.payment_status, time_zone:row.time_zone, time_zone_label:zoneLabel(row.time_zone),
+    service_title:row.service_title
+  };
+}
 const roles=['owner','staff'];
 function invite(mid,email,role,actor,ttl=48*3600000) {
   if (!roles.includes(role)) err(400,'邀请角色无效');
@@ -130,7 +152,7 @@ function audit(user,action,subject,detail='') {
 async function route(req,res,url) {
   const path=url.pathname,method=req.method,ip=req.socket.remoteAddress||'unknown';
   if (!['GET','HEAD'].includes(method)) verifyOrigin(req);
-  if (method==='GET' && path==='/api/health') { db.prepare('SELECT 1').get(); return json(res,200,{ok:true,version:'2.1.0',database:'sqlite'}); }
+  if (method==='GET' && path==='/api/health') { db.prepare('SELECT 1').get(); return json(res,200,{ok:true,version:'2.3.0',database:'postgres'}); }
 
   if (method==='POST' && path==='/api/auth/login') {
     throttle('login:'+ip,12,15*60000);
@@ -145,7 +167,7 @@ async function route(req,res,url) {
   }
   if (method==='GET' && path==='/api/auth/me') {
     const user=requireSession(req);
-    const merchant=user.merchant_id ? db.prepare('SELECT id,slug,name,intro,address,phone,accent FROM merchants WHERE id=?').get(user.merchant_id) : null;
+    const merchant=user.merchant_id ? db.prepare('SELECT id,slug,name,intro,address,phone,accent,time_zone FROM merchants WHERE id=?').get(user.merchant_id) : null;
     return json(res,200,{user:{email:user.email,role:user.role,id:user.id},merchant});
   }
   if (method==='POST' && path==='/api/auth/logout') {
@@ -168,7 +190,8 @@ async function route(req,res,url) {
   }
   let m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})$/);
   if (method==='GET' && m) {
-    const {slug,name,intro,address,accent}=shop(m[1]); return json(res,200,{merchant:{slug,name,intro,address,accent}});
+    const studio=shop(m[1]);
+    return json(res,200,{merchant:{slug:studio.slug,name:studio.name,intro:studio.intro,address:studio.address,accent:studio.accent,time_zone:studio.time_zone,time_zone_label:zoneLabel(studio.time_zone)}});
   }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/services$/);
   if (method==='GET' && m) {
@@ -185,7 +208,7 @@ async function route(req,res,url) {
     return json(res,200,{items:items.map(({active,...row})=>({...row,requirements:rulesForPackage(row.id)}))});
   }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/days-off$/);
-  if (method==='GET' && m) return json(res,200,{dates:db.prepare('SELECT date FROM days_off WHERE merchant_id=? AND date>=? ORDER BY date').all(shop(m[1]).id,shopDate(1)).map(x=>x.date)});
+  if (method==='GET' && m) { const studio=shop(m[1]); return json(res,200,{dates:db.prepare('SELECT date FROM days_off WHERE merchant_id=? AND date>=? ORDER BY date').all(studio.id,zonedDate(studio.time_zone,1)).map(x=>x.date)}); }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/availability$/);
   if(method==='GET'&&m) {
     const mid=shop(m[1]).id,date=url.searchParams.get('date');
@@ -213,31 +236,62 @@ async function route(req,res,url) {
     }
     return json(res,200,{closed,busy,available_slots});
   }
+  m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/bookings\/([A-Za-z0-9-]{8,40})\/pay$/);
+  if (method==='POST' && m) {
+    throttle('pay:'+ip,20,10*60000);
+    const booking=publicBooking(m[1],m[2]);
+    assertPhone(booking, await getBody(req));
+    const result=await payBooking(booking);
+    const fresh=db.prepare('SELECT payment_status FROM bookings WHERE id=?').get(booking.id);
+    return json(res,200,{payment_status:fresh.payment_status,provider:result.provider,code_url:result.code_url||''});
+  }
+  m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/bookings\/([A-Za-z0-9-]{8,40})\/cancel$/);
+  if (method==='POST' && m) {
+    throttle('cancel:'+ip,20,10*60000);
+    const booking=publicBooking(m[1],m[2]);
+    assertPhone(booking, await getBody(req));
+    if (!['pending','confirmed'].includes(booking.status)) err(409,'已完成、已拒绝或已取消的预约不能再取消');
+    transaction(() => {
+      const fresh=db.prepare('SELECT * FROM bookings WHERE id=? AND merchant_id=?').get(booking.id,booking.merchant_id);
+      if (!fresh || !['pending','confirmed'].includes(fresh.status)) err(409,'已完成、已拒绝或已取消的预约不能再取消');
+      refundBooking(fresh);
+      db.prepare('DELETE FROM booking_allocations WHERE booking_id=?').run(fresh.id);
+      db.prepare('UPDATE bookings SET status=?,updated_at=now() WHERE id=?').run('cancelled',fresh.id);
+      db.prepare('INSERT INTO events(id,booking_id,actor,action,before_value,after_value) VALUES(?,?,?,?,?,?)')
+        .run(uid(),fresh.id,'customer','cancel',fresh.status,'cancelled');
+    });
+    const saved=db.prepare('SELECT * FROM bookings WHERE id=?').get(booking.id);
+    try { await refundRemote(saved); } catch (error) { console.error('remote refund:', error.message); }
+    await notifyBooking('cancelled', saved, booking.merchant_name);
+    return json(res,200,{ok:true,status:'cancelled',payment_status:saved.payment_status});
+  }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/bookings\/([A-Za-z0-9-]{8,40})$/);
   if (method==='GET' && m) {
     throttle('lookup:'+ip,40,10*60000);
     const code=m[2].toUpperCase();
     if (!/^YK[A-Z0-9]+$/.test(code)) err(400,'预约编号格式不正确');
     const row=db.prepare(`SELECT b.code,b.status,b.preferred_date,b.preferred_time,b.duration_minutes,
-      b.package_title_snapshot AS package_title, s.title AS service_title
+      b.package_title_snapshot AS package_title,b.package_price_cents,b.payment_status,b.time_zone,
+      s.title AS service_title
       FROM bookings b JOIN services s ON s.id=b.service_id
       WHERE b.merchant_id=? AND b.code=?`).get(shop(m[1]).id, code);
     if (!row) err(404,'没有找到对应的预约申请');
-    return json(res,200,{booking:row});
+    return json(res,200,{booking:bookingView(row)});
   }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/bookings$/);
   if(method==='POST'&&m) {
     throttle('book:'+ip,18,3600000);
-    const mid=shop(m[1]).id,data=await getBody(req);
+    const studio=shop(m[1]),mid=studio.id,data=await getBody(req);
     if(data.website) err(400,'请求无效');
     const service=db.prepare('SELECT id FROM services WHERE merchant_id=? AND id=? AND active=1').get(mid,required(data.service_id,80));
     if(!service) err(400,'服务不存在或已下架');
     const pack=currentPackage(mid,service.id,data.package_id||null);
     const preferred_date=required(data.preferred_date,10),preferred_time=required(data.preferred_time,5);
-    validateSlot(preferred_date,preferred_time,pack.duration_minutes,pack.buffer_before,pack.buffer_after);
+    validateSlot(preferred_date,preferred_time,pack.duration_minutes,pack.buffer_before,pack.buffer_after,studio.time_zone);
     if(data.consent!==true) err(400,'请确认预约信息处理告知');
-    const contact_name=required(data.contact_name,40),contact_phone=required(data.contact_phone,30),note=optional(data.note,500);
+    const contact_name=required(data.contact_name,40),contact_phone=required(data.contact_phone,30),contact_email=emailOf(data.contact_email),note=optional(data.note,500);
     if(!/^[+0-9()\s-]{7,25}$/.test(contact_phone)) err(400,'请填写有效联系方式');
+    const startsAt=localToUtcMs(preferred_date,preferred_time,studio.time_zone);
     const key=req.headers['idempotency-key'];
     if(key&&(typeof key!=='string'|| !/^[a-zA-Z0-9_-]{10,100}$/.test(key))) err(400,'幂等键格式不正确');
     const outcome=transaction(()=>{
@@ -251,16 +305,20 @@ async function route(req,res,url) {
       allocate({merchantId:mid,date:preferred_date,time:preferred_time,duration:pack.duration_minutes,
         before:pack.buffer_before,after:pack.buffer_after,requirements:rules});
       const id=uid(),code='YK'+new Date().toISOString().slice(0,10).replaceAll('-','')+randomBytes(6).toString('hex').toUpperCase();
-      db.prepare(`INSERT INTO bookings(id,merchant_id,service_id,code,contact_name,contact_phone,preferred_date,
-        preferred_time,note,consent_at,duration_minutes,package_id,buffer_before,buffer_after,package_title_snapshot,package_price_cents)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(id,mid,service.id,code,contact_name,contact_phone,preferred_date,preferred_time,note,
+      db.prepare(`INSERT INTO bookings(id,merchant_id,service_id,code,contact_name,contact_phone,contact_email,preferred_date,
+        preferred_time,starts_at,time_zone,note,consent_at,duration_minutes,package_id,buffer_before,buffer_after,package_title_snapshot,package_price_cents)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(id,mid,service.id,code,contact_name,contact_phone,contact_email,preferred_date,preferred_time,startsAt,studio.time_zone,note,
           new Date().toISOString(),pack.duration_minutes,pack.id,pack.buffer_before,pack.buffer_after,pack.title,pack.price_cents);
       for(const rule of rules)db.prepare('INSERT INTO booking_requirements(booking_id,kind,quantity) VALUES(?,?,?)')
         .run(id,rule.kind,rule.quantity);
       if(key)db.prepare('INSERT INTO idempotency(merchant_id,request_key,booking_id) VALUES(?,?,?)').run(mid,key,id);
-      return {code,status:'pending'};
+      return {id,code,status:'pending'};
     });
+    if(!outcome.already){
+      const saved=db.prepare('SELECT * FROM bookings WHERE id=?').get(outcome.id);
+      await notifyBooking('submitted', saved, studio.name);
+    }
     return json(res,outcome.already?200:201,{code:outcome.code,status:outcome.status,message:'预约申请已提交，等待商家确认'});
   }
 
@@ -371,9 +429,9 @@ async function merchantRoutes(req,res,url,user) {
   const mid=merchantOf(user),path=url.pathname,method=req.method;
   if (method==='GET'&&path==='/api/admin/dashboard') {
     const totals=db.prepare('SELECT status,COUNT(*) AS count FROM bookings WHERE merchant_id=? GROUP BY status').all(mid);
-    const recent=db.prepare(`SELECT b.id,b.code,b.contact_name,b.preferred_date,b.preferred_time,b.status,b.created_at,
+    const recent=db.prepare(`SELECT b.id,b.code,b.contact_name,b.preferred_date,b.preferred_time,b.status,b.payment_status,b.time_zone,b.created_at,
       s.title AS service_title,b.package_title_snapshot AS package_title
-      FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.merchant_id=? ORDER BY b.created_at DESC, b.rowid DESC LIMIT 8`).all(mid);
+      FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.merchant_id=? ORDER BY b.created_at DESC, b.seq DESC LIMIT 8`).all(mid);
     return json(res,200,{totals,recent});
   }
   if (method==='GET'&&path==='/api/admin/bookings') {
@@ -383,9 +441,9 @@ async function merchantRoutes(req,res,url,user) {
     const where=` WHERE b.merchant_id=? AND (?='' OR b.status=?) AND (?='' OR b.code LIKE ? OR b.contact_name LIKE ? OR b.contact_phone LIKE ?)`;
     const params=[mid,status,status,search,'%'+search+'%','%'+search+'%','%'+search+'%'];
     const total=db.prepare('SELECT COUNT(*) AS n FROM bookings b'+where).get(...params).n;
-    const items=db.prepare(`SELECT b.id,b.code,b.contact_name,b.contact_phone,b.preferred_date,b.preferred_time,
-      b.duration_minutes,b.note,b.status,b.created_at,b.updated_at,s.title AS service_title,b.package_title_snapshot AS package_title,b.package_price_cents
-      FROM bookings b JOIN services s ON s.id=b.service_id ${where} ORDER BY b.created_at DESC, b.rowid DESC LIMIT 20 OFFSET ?`)
+    const items=db.prepare(`SELECT b.id,b.code,b.contact_name,b.contact_phone,b.contact_email,b.preferred_date,b.preferred_time,
+      b.duration_minutes,b.note,b.status,b.payment_status,b.time_zone,b.starts_at,b.created_at,b.updated_at,s.title AS service_title,b.package_title_snapshot AS package_title,b.package_price_cents
+      FROM bookings b JOIN services s ON s.id=b.service_id ${where} ORDER BY b.created_at DESC, b.seq DESC LIMIT 20 OFFSET ?`)
       .all(...params,(page-1)*20);
     for(const booking of items)booking.allocations=db.prepare(`SELECT r.id AS resource_id,r.name,r.kind,a.quantity FROM booking_allocations a JOIN resources r ON r.id=a.resource_id WHERE a.booking_id=?`).all(booking.id);
     return json(res,200,{items,total,page,pageSize:20});
@@ -411,10 +469,16 @@ async function merchantRoutes(req,res,url,user) {
   if (method==='PATCH'&&m) {
     const data=await getBody(req),next=required(data.status,20);
     const allowed={pending:['confirmed','rejected','cancelled'],confirmed:['completed','cancelled'],completed:[],rejected:[],cancelled:[]};
+    const merchantName=db.prepare('SELECT name FROM merchants WHERE id=?').get(mid).name;
+    let saved=null;
     transaction(() => {
       const old=db.prepare('SELECT * FROM bookings WHERE id=? AND merchant_id=?').get(m[1],mid);
       if (!old) err(404,'订单不存在');
       if (!allowed[old.status]?.includes(next)) err(409,'当前状态不能执行该操作');
+      if(next==='cancelled') {
+        refundBooking(old);
+        db.prepare('DELETE FROM booking_allocations WHERE booking_id=?').run(old.id);
+      }
       if(next==='confirmed') {
         const selected=allocate({merchantId:mid,date:old.preferred_date,time:old.preferred_time,
           duration:old.duration_minutes,before:old.buffer_before,after:old.buffer_after,
@@ -425,8 +489,11 @@ async function merchantRoutes(req,res,url,user) {
         .run(next,old.id,mid);
       db.prepare('INSERT INTO events(id,booking_id,actor,action,before_value,after_value) VALUES(?,?,?,?,?,?)')
         .run(uid(),old.id,user.id,'status',old.status,next);
+      if(next==='confirmed'||next==='cancelled') saved=db.prepare('SELECT * FROM bookings WHERE id=?').get(old.id);
     });
-    return json(res,200,{ok:true,status:next});
+    if(next==='cancelled'&&saved) { try { await refundRemote(saved); } catch (error) { console.error('remote refund:', error.message); } }
+    if(saved) await notifyBooking(next, saved, merchantName);
+    return json(res,200,{ok:true,status:next,payment_status:saved?.payment_status});
   }
   if (method==='GET'&&path==='/api/admin/services') return json(res,200,{items:db.prepare(`SELECT ${serviceFields} FROM services WHERE merchant_id=? ORDER BY created_at DESC`).all(mid)});
   m=path.match(/^\/api\/admin\/services(?:\/([\w-]+))?$/);
@@ -486,7 +553,7 @@ async function merchantRoutes(req,res,url,user) {
     transaction(()=>{
       const claims=db.prepare(`SELECT b.id,b.preferred_date,b.preferred_time,b.duration_minutes,b.buffer_before,b.buffer_after,a.quantity
         FROM booking_allocations a JOIN bookings b ON b.id=a.booking_id
-        WHERE a.resource_id=? AND b.merchant_id=? AND b.status='confirmed' AND b.preferred_date>=?`).all(resource.id,mid,shopDate());
+        WHERE a.resource_id=? AND b.merchant_id=? AND b.status='confirmed' AND b.preferred_date>=?`).all(resource.id,mid,zonedDate(merchantZone(mid)));
       if(!data.active&&claims.length)err(409,'资源仍有未来已确认预约，请先调整或取消');
       if(data.active&&capacity<resource.capacity){
         const dates=[...new Set(claims.map(c=>c.preferred_date))];
@@ -511,12 +578,12 @@ async function merchantRoutes(req,res,url,user) {
     const date=url.searchParams.get('date');
     if(date&&!dateOK(date))err(400,'日期不正确');
     const items=date ? db.prepare(`SELECT b.* FROM resource_blocks b WHERE b.merchant_id=? AND b.date=? ORDER BY b.start_min`).all(mid,date)
-      : db.prepare(`SELECT b.* FROM resource_blocks b WHERE b.merchant_id=? AND b.date>=? ORDER BY b.date,b.start_min LIMIT 250`).all(mid,shopDate());
+      : db.prepare(`SELECT b.* FROM resource_blocks b WHERE b.merchant_id=? AND b.date>=? ORDER BY b.date,b.start_min LIMIT 250`).all(mid,zonedDate(merchantZone(mid)));
     return json(res,200,{items});
   }
   if(method==='POST'&&path==='/api/admin/resource-blocks') {
     requireOwner(user);const data=await getBody(req),resourceId=required(data.resource_id,100),date=required(data.date,10);
-    if(!dateOK(date)||date<shopDate())err(400,'不可封闭已过去的日期');
+    if(!dateOK(date)||date<zonedDate(merchantZone(mid)))err(400,'不可封闭已过去的日期');
     const start=minute(required(data.start_time,8)),end=minute(required(data.end_time,8)),reason=optional(data.reason,200);
     if(start>=end)err(400,'结束时间必须晚于开始时间');
     transaction(()=>{
@@ -551,7 +618,7 @@ async function merchantRoutes(req,res,url,user) {
     }
     transaction(()=>{
       const claims=db.prepare(`SELECT b.preferred_date,b.preferred_time,b.duration_minutes,b.buffer_before,b.buffer_after FROM booking_allocations a
-        JOIN bookings b ON b.id=a.booking_id WHERE a.resource_id=? AND b.status='confirmed' AND b.preferred_date>=?`).all(m[1],shopDate());
+        JOIN bookings b ON b.id=a.booking_id WHERE a.resource_id=? AND b.status='confirmed' AND b.preferred_date>=?`).all(m[1],zonedDate(merchantZone(mid)));
       if(validated.length){for(const claim of claims){
         const weekday=new Date(claim.preferred_date+'T00:00:00Z').getUTCDay();
         const start=minute(claim.preferred_time)-claim.buffer_before;
@@ -621,10 +688,22 @@ async function merchantRoutes(req,res,url,user) {
     });
     return json(res,200,{ok:true});
   }
+  if (method==='GET'&&path==='/api/admin/notifications') {
+    const event=url.searchParams.get('event')||'';
+    if (event && !['submitted','confirmed','cancelled'].includes(event)) err(400,'通知类型无效');
+    const items=event
+      ? db.prepare(`SELECT id,booking_id,channel,event,recipient,subject,body,status,provider,created_at
+          FROM notifications WHERE merchant_id=? AND event=? ORDER BY created_at DESC LIMIT 100`).all(mid,event)
+      : db.prepare(`SELECT id,booking_id,channel,event,recipient,subject,body,status,provider,created_at
+          FROM notifications WHERE merchant_id=? ORDER BY created_at DESC LIMIT 100`).all(mid);
+    return json(res,200,{items});
+  }
   if (method==='PATCH'&&path==='/api/admin/merchant') {
     requireOwner(user);const data=await getBody(req),name=required(data.name,80),intro=optional(data.intro,500),address=optional(data.address,200),phone=optional(data.phone,50);
-    db.prepare('UPDATE merchants SET name=?,intro=?,address=?,phone=? WHERE id=?').run(name,intro,address,phone,mid);
-    return json(res,200,{ok:true});
+    const timeZone=data.time_zone===undefined?merchantZone(mid):data.time_zone;
+    if(!zoneOk(timeZone)) err(400,'时区无效');
+    db.prepare('UPDATE merchants SET name=?,intro=?,address=?,phone=?,time_zone=? WHERE id=?').run(name,intro,address,phone,timeZone,mid);
+    return json(res,200,{ok:true,time_zone:timeZone,time_zone_label:zoneLabel(timeZone)});
   }
   if (method==='GET'&&path==='/api/admin/team') {
     requireOwner(user);

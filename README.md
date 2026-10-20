@@ -2,7 +2,7 @@
 
 [![tests-and-build](https://github.com/jiaozi-creator/appointment-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/jiaozi-creator/appointment-assistant/actions/workflows/ci.yml)
 
-面向摄影工作室的预约申请与管理系统。**本分支为多商家 SaaS 受控试点基础版，不等于已完成商用上线审核。** 技术栈：Vue 3 + Vite，Node.js 22+ 原生 HTTP 服务，SQLite（版本化迁移、WAL、事务）。**同一套资源模型支持单人摄影师及多人/多影棚工作室。**
+面向摄影工作室的预约申请与管理系统。**本分支为多商家 SaaS 受控试点基础版，不等于已完成商用上线审核。** 技术栈：Vue 3 + Vite，Node.js 22+ 原生 HTTP 服务，PostgreSQL（多进程共享同一数据库）。**同一套资源模型支持单人摄影师及多人/多影棚工作室。**
 
 ## 已实现的业务流程
 
@@ -10,7 +10,7 @@
 2. 商家所有者通过 `/invite/:token` 创建密码登录 `/login`，进入 `/admin` 管理服务项目、休息日、工作室资料和预约订单。
 3. 老板可在“成员与权限”创建48小时**员工邀请**。员工只能查看和处理预约，不能修改服务、工作室资料及邀请成员。老板停用员工后其会话立即失效。
 4. 客户进入 `/s/:slug` 浏览某个工作室的上架服务，选择日期与时段，接受告知，提交**待确认**预约申请。展示已确认预约的占用时段（不披露个人信息）。提交后可用预约编号在工作室主页查询进度；查询结果不含姓名和电话，刷新页面后仍然有效。
-5. 商家把待确认预约改为“已确认”时，后端开启 SQLite 写事务，检查服务时长与已确认/已完成订单的时间区间是否重叠；冲突则返回409，**不允许重复占用**。同一时段允许多个待处理申请；确认时按摄影师、影棚与设备的实际容量分配，可以同时确认互不冲突的多笔预约。
+5. 商家把待确认预约改为“已确认”时，后端在 PostgreSQL 事务里用咨询锁保护该工作室当天档期，按剩余容量、当天已确认负荷和冲突检查分配资源；冲突则返回409，**不允许重复占用**。同一时段允许多个待处理申请。自动分配不再按资源名称排序。客户可凭预约编号和电话自行支付或取消。时间按工作室时区展示，开始时间以 UTC 毫秒存储。
 6. 平台管理员能暂停/恢复商家账户，仅能查看入驻申请和工作室基本资料，**不能默认查询商家私人预约列表**。
 7. 管理页面包含工作台统计、订单筛选/分页、CSV导出当前页、服务管理、休息日、商家设置、团队成员。
 8. 老板可维护**摄影师、场地、设备**资源、容量、每周可用时段及临时封档；为服务创建不同套餐并设置摄影师/场地/设备需求，客户选套餐预约，订单确认时可自动分配或由商家手动指定具体资源。
@@ -29,7 +29,7 @@
 
 ## 在本地启动
 
-需要 **Node.js 22.13+**，建议 22.16 及更新的22.x版本。`node:sqlite` 在该版本仍会产生实验性警告。后端不需要 npm 第三方依赖。
+需要 **Node.js 22.13+** 和本机 PostgreSQL 16。复制 `.env.example` 为环境变量，至少设置 `DATABASE_URL`。后端依赖 `pg`。未配置 SMTP、阿里云短信或微信支付时，通知和支付走可断言的测试通道。
 
 **终端 A：**
 
@@ -69,7 +69,7 @@ npm --prefix web run build   # 真正的Vite前端构建
 npm start                    # 构建后由Node同源托管Vue前端与API
 ```
 
-服务在本地默认监听 `127.0.0.1:3001`。数据库文件默认 `data/appointment.sqlite`（已gitignore）。不要删除有真实数据的数据库以便重新初始化账号。测试套件使用完全独立的临时数据库。
+服务在本地默认监听 `127.0.0.1:3001`。默认数据库是 `postgres://appointment:appointment@127.0.0.1:5432/appointment`。不要清空有真实数据的库来重新初始化账号。测试套件会创建并删除独立的 `aa_*` 数据库。
 
 ### API 概览
 
@@ -77,7 +77,9 @@ npm start                    # 构建后由Node同源托管Vue前端与API
 |---|---|
 | 公开 | `GET /api/public/shops/:slug`、`/services`、`/availability?date=YYYY-MM-DD` |
 | 公开写入 | `POST /api/public/shops/:slug/bookings`、`POST /api/public/merchant-applications` |
-| 公开查询 | `GET /api/public/shops/:slug/bookings/:code`（仅状态、服务、日期时段，不含联系方式） |
+| 公开查询 | `GET /api/public/shops/:slug/bookings/:code`（状态、支付、时区、服务和时间；不含姓名、电话、邮箱、备注） |
+| 客户支付 / 取消 | `POST /api/public/shops/:slug/bookings/:code/pay`、`/cancel`，请求体需带预约电话 |
+| 商家通知 | `GET /api/admin/notifications` |
 | 身份 | `POST /api/auth/login`、`/logout`、`GET /api/auth/me` |
 | 激活 | `GET /api/invitations/:token`、`POST /api/invitations/:token/accept` |
 | 商家 | `/api/admin/dashboard`、`/bookings`、`/services`、`/packages`、`/resources`、`/resource-blocks`、`/resource-calendar`、`/days-off`、`/merchant`、`/team` |
@@ -87,7 +89,7 @@ npm start                    # 构建后由Node同源托管Vue前端与API
 
 ## 架构、安全与生产部署
 
-- SQL 迁移：`server/migrations/001_initial.sql` + `002_saas.sql` + `003_resources_packages.sql`，每个版本事务提交，自动兼容旧版无版本表的数据库；升级前必须备份。**尚未迁移到PostgreSQL**。
+- SQL 迁移：`server/migrations-pg/001_postgres.sql`。旧的 SQLite 迁移文件保留作历史，不会对 PostgreSQL 执行，也不会自动导入旧的 sqlite 文件。升级前用 `pg_dump` 备份。
 - 多商家隔离：应用服务端强制 `merchant_id`、会话权限与停用状态；邀请 Token 只保存哈希；密码使用 scrypt；HttpOnly 会话Cookie、SameSite、CSRF令牌；POST具有简单限速及幂等键；订单修改写事件表。
 - 档期限制：商家默认为 **Asia/Shanghai时区、09:00–21:00**，资源分配使用半开区间、拍摄准备/收尾缓冲、摄影师/影棚独占和设备共享容量；允许多名摄影师并行工作，但不支持跨夜拍摄、跨时区或支付。
 - 数据隐私：真实姓名/电话属于个人信息；在正式运营前需确定个人信息处理角色、隐私告知、收集依据、保留期限、备份加密、删除与访问请求机制。Demo 用虚拟资料。
