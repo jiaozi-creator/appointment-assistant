@@ -138,6 +138,8 @@ test('Pending overlapping requests, confirmation mutex, availability and day-off
 test('Platform suspends shop without leaking private tenant data',async()=>{
   const overview=await req('/platform/overview','GET',null,'platform');
   const sea=overview.data.merchants.find(x=>x.slug==='sea-photo');assert.ok(sea);
+  assert.equal(overview.data.merchants.find(x=>x.slug==='forest-photo').has_owner,1);
+  assert.equal(sea.has_owner,1);
   assert.equal((await req('/platform/merchants/'+sea.id+'/active','PATCH',{active:false},'platform')).status,200);
   assert.equal((await req('/public/shops/sea-photo')).status,404);
   assert.equal((await req('/admin/services','GET',null,'sea')).status,401);
@@ -176,6 +178,15 @@ test('Resources, package snapshots, concurrent teams, allocation capacity, tenan
   assert.equal((await req('/admin/bookings/'+x.id+'/status','PATCH',{status:'confirmed',allocations:[
     {resource_id:existing.find(r=>r.kind==='photographer').id,quantity:1},{resource_id:room1,quantity:1},{resource_id:gear,quantity:1}
   ]},'owner')).status,200);
+  const needsY=await req('/admin/bookings/'+y.id+'/resource-needs','GET',null,'owner');
+  assert.equal(needsY.status,200,JSON.stringify(needsY.data));
+  const freeOf=id=>needsY.data.resources.find(r=>r.id===id).free;
+  assert.equal(freeOf(existing.find(r=>r.kind==='photographer').id),0);
+  assert.equal(freeOf(photo2),1);
+  assert.equal(freeOf(room1),0);
+  assert.equal(freeOf(room2),1);
+  assert.equal(freeOf(gear),1);
+  assert.equal(needsY.data.closed,false);
   const other=(await req('/admin/bookings/'+y.id+'/status','PATCH',{status:'confirmed',allocations:[
     {resource_id:photo2,quantity:1},{resource_id:room2,quantity:1},{resource_id:gear,quantity:1}
   ]},'owner'));assert.equal(other.status,200,JSON.stringify(other.data));
@@ -191,7 +202,9 @@ test('Resources, package snapshots, concurrent teams, allocation capacity, tenan
   assert.equal(saved.package_price_cents,89900);assert.equal(saved.package_title,'影棚写真双机位');
   assert.equal(saved.allocations.length,3);
   assert.equal((await req('/admin/resources','GET',null,'sea')).data.items.every(r=>r.id!==photo2),true);
-  assert.equal((await req('/admin/resources','POST',{kind:'equipment',name:'拒绝操作',capacity:1},'staff')).status,401);
+  await login('staff','staff@sea.test','secure-staff-passphrase');
+  assert.equal((await req('/admin/resources','POST',{kind:'equipment',name:'拒绝操作',capacity:1},'staff')).status,403);
+  assert.equal((await req('/admin/packages','POST',{service_id:id,title:'员工不可建套餐',price_cents:1000,duration_minutes:60,requirements:[{kind:'photographer',quantity:1}]},'staff')).status,403);
   assert.equal((await req('/admin/packages','POST',{service_id:id,title:'无权',price_cents:1000,duration_minutes:60,
     requirements:[{kind:'photographer',quantity:1}]},'sea')).status,404);
   const calendar=(await req('/admin/resource-calendar?date='+day,'GET',null,'owner')).data;
@@ -253,6 +266,54 @@ test('Release resources after cancellation, block only assigned resources, and e
   for(const block of blocks){if(block.resource_id===photographer.id){await req('/admin/resource-blocks/'+block.id,'DELETE',null,'owner')}}
   const open=await req('/public/shops/forest-photo/availability?date='+date2()+'&service_id='+ownerServices[0].id+'&package_id='+pkg.data.id);
   assert.equal(open.data.available_slots.includes('10:00'),true);
+});
+
+test('Booking lookup hides contact details, and merchant sees the customer note',async()=>{
+  const services=(await req('/public/shops/forest-photo/services')).data.items;
+  const day=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(Date.now()+40*86400000));
+  const made=await req('/public/shops/forest-photo/bookings','POST',{
+    service_id:services[0].id,preferred_date:day,preferred_time:'11:00',contact_name:'窗边客户',contact_phone:'13800138000',
+    note:'希望安排窗边',consent:true
+  });
+  assert.equal(made.status,201,JSON.stringify(made.data));
+  const listed=(await req('/admin/bookings?q='+made.data.code,'GET',null,'owner')).data.items.find(b=>b.code===made.data.code);
+  assert.equal(listed.note,'希望安排窗边');
+  assert.equal(listed.contact_name,'窗边客户');
+  const recent=(await req('/admin/dashboard','GET',null,'owner')).data.recent.find(b=>b.code===made.data.code);
+  assert.ok(recent);
+  assert.equal(recent.contact_name,'窗边客户');
+  assert.equal(recent.package_title,'标准套餐');
+  const lookup=await req('/public/shops/forest-photo/bookings/'+made.data.code);
+  assert.equal(lookup.status,200);
+  assert.equal(lookup.data.booking.status,'pending');
+  assert.equal(lookup.data.booking.service_title,services[0].title);
+  const body=JSON.stringify(lookup.data);
+  assert.equal(body.includes('13800138000'),false);
+  assert.equal(body.includes('窗边客户'),false);
+  assert.equal(body.includes('希望安排窗边'),false);
+  assert.equal((await req('/public/shops/sea-photo/bookings/'+made.data.code)).status,404);
+  assert.equal((await req('/public/shops/forest-photo/bookings/YKDOESNOTEXIST1234')).status,404);
+  assert.equal((await req('/admin/days-off','PUT',{dates:[day]},'owner')).status,200);
+  const blocked=await req('/public/shops/forest-photo/bookings','POST',{
+    service_id:services[0].id,preferred_date:day,preferred_time:'16:00',contact_name:'另一客户',contact_phone:'13800138000',consent:true
+  });
+  assert.equal(blocked.status,409);
+  assert.match(blocked.data.error,/暂停/);
+  assert.equal((await req('/admin/days-off','PUT',{dates:[]},'owner')).status,200);
+  const room=(await req('/admin/resources','GET',null,'owner')).data.items.find(r=>r.kind==='room'&&r.active);
+  const seconds=await req('/admin/resource-blocks','POST',{resource_id:room.id,date:day,start_time:'15:00:00',end_time:'16:30:00',reason:'浏览器时间'},'owner');
+  assert.equal(seconds.status,201,JSON.stringify(seconds.data));
+  const blocks=(await req('/admin/resource-blocks?date='+day,'GET',null,'owner')).data.items;
+  assert.equal(blocks.some(b=>b.start_min===15*60&&b.end_min===16*60+30),true);
+  for (const block of blocks) await req('/admin/resource-blocks/'+block.id,'DELETE',null,'owner');
+  assert.equal((await req('/admin/services','POST',{title:'过长时长',price_cents:100,duration_minutes:721},'owner')).status,400);
+  assert.equal((await req('/admin/packages','POST',{service_id:services[0].id,title:'缺少摄影师',price_cents:100,duration_minutes:60,requirements:[{kind:'room',quantity:1}]},'owner')).status,400);
+  const described=await req('/admin/services/'+services[0].id,'PATCH',{
+    title:services[0].title,description:'同步到标准套餐的说明',price_cents:services[0].price_cents,duration_minutes:services[0].duration_minutes,active:true
+  },'owner');
+  assert.equal(described.status,200,JSON.stringify(described.data));
+  const synced=(await req('/admin/packages','GET',null,'owner')).data.items.find(p=>p.service_id===services[0].id&&p.is_default);
+  assert.equal(synced.description,'同步到标准套餐的说明');
 });
 
 test('Logout invalidates owner session',async()=>{

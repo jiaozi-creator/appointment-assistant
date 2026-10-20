@@ -21,3 +21,4 @@
 .assign-item label{display:flex;align-items:center;gap:8px;font-size:12px}
 .assign-item input{width:74px}
 .assignment-dialog{max-height:90vh;overflow-y:auto}
+.booking-note{display:block;max-width:420px;color:#5f7266;font-size:12px;line-height:1.6;margin-top:6px;white-space:pre-wrap}

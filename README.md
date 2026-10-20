@@ -9,7 +9,7 @@
 1. 摄影商家提交**入驻申请**（`/apply`），平台管理员登录 `/platform` 后审核。通过后生成仅展示一次的72小时**所有者激活邀请**，须由管理员自行核实申请人并安全传达（**不自动发邮件**）。
 2. 商家所有者通过 `/invite/:token` 创建密码登录 `/login`，进入 `/admin` 管理服务项目、休息日、工作室资料和预约订单。
 3. 老板可在“成员与权限”创建48小时**员工邀请**。员工只能查看和处理预约，不能修改服务、工作室资料及邀请成员。老板停用员工后其会话立即失效。
-4. 客户进入 `/s/:slug` 浏览某个工作室的上架服务，选择日期与时段，接受告知，提交**待确认**预约申请。展示已确认预约的占用时段（不披露个人信息）。
+4. 客户进入 `/s/:slug` 浏览某个工作室的上架服务，选择日期与时段，接受告知，提交**待确认**预约申请。展示已确认预约的占用时段（不披露个人信息）。提交后可用预约编号在工作室主页查询进度；查询结果不含姓名和电话，刷新页面后仍然有效。
 5. 商家把待确认预约改为“已确认”时，后端开启 SQLite 写事务，检查服务时长与已确认/已完成订单的时间区间是否重叠；冲突则返回409，**不允许重复占用**。同一时段允许多个待处理申请；确认时按摄影师、影棚与设备的实际容量分配，可以同时确认互不冲突的多笔预约。
 6. 平台管理员能暂停/恢复商家账户，仅能查看入驻申请和工作室基本资料，**不能默认查询商家私人预约列表**。
 7. 管理页面包含工作台统计、订单筛选/分页、CSV导出当前页、服务管理、休息日、商家设置、团队成员。
@@ -77,6 +77,7 @@ npm start                    # 构建后由Node同源托管Vue前端与API
 |---|---|
 | 公开 | `GET /api/public/shops/:slug`、`/services`、`/availability?date=YYYY-MM-DD` |
 | 公开写入 | `POST /api/public/shops/:slug/bookings`、`POST /api/public/merchant-applications` |
+| 公开查询 | `GET /api/public/shops/:slug/bookings/:code`（仅状态、服务、日期时段，不含联系方式） |
 | 身份 | `POST /api/auth/login`、`/logout`、`GET /api/auth/me` |
 | 激活 | `GET /api/invitations/:token`、`POST /api/invitations/:token/accept` |
 | 商家 | `/api/admin/dashboard`、`/bookings`、`/services`、`/packages`、`/resources`、`/resource-blocks`、`/resource-calendar`、`/days-off`、`/merchant`、`/team` |

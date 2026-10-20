@@ -3,7 +3,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve, extname } from 'node:path';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { db, uid, checkPassword, hashPassword, transaction } from './db.js';
-import { allocate, minute, requirementsOf, requiredResourcesForBooking, RESOURCE_KINDS } from './scheduling.js';
+import { allocate, minute, requirementsOf, requiredResourcesForBooking, RESOURCE_KINDS, freeAt } from './scheduling.js';
 
 const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -36,7 +36,7 @@ const shopDate = (offsetDays = 0) => {
   const now = new Date(Date.now() + offsetDays * 86400000);
   return new Intl.DateTimeFormat('sv-SE',{ timeZone: 'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit' }).format(now);
 };
-const timeMinutes = text => { if (typeof text !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(text)) err(400,'时间格式不正确'); return Number(text.slice(0,2))*60+Number(text.slice(3)); };
+const timeMinutes = text => { try { return minute(text); } catch (e) { if (e.status===400) err(400,'时间格式不正确'); throw e; } };
 const rate = new Map();
 function throttle(key, max, windowMs) {
   const now = Date.now(); const item = rate.get(key);
@@ -213,6 +213,18 @@ async function route(req,res,url) {
     }
     return json(res,200,{closed,busy,available_slots});
   }
+  m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/bookings\/([A-Za-z0-9-]{8,40})$/);
+  if (method==='GET' && m) {
+    throttle('lookup:'+ip,40,10*60000);
+    const code=m[2].toUpperCase();
+    if (!/^YK[A-Z0-9]+$/.test(code)) err(400,'预约编号格式不正确');
+    const row=db.prepare(`SELECT b.code,b.status,b.preferred_date,b.preferred_time,b.duration_minutes,
+      b.package_title_snapshot AS package_title, s.title AS service_title
+      FROM bookings b JOIN services s ON s.id=b.service_id
+      WHERE b.merchant_id=? AND b.code=?`).get(shop(m[1]).id, code);
+    if (!row) err(404,'没有找到对应的预约申请');
+    return json(res,200,{booking:row});
+  }
   m=path.match(/^\/api\/public\/shops\/([a-z0-9-]{3,60})\/bookings$/);
   if(method==='POST'&&m) {
     throttle('book:'+ip,18,3600000);
@@ -291,7 +303,9 @@ async function platformRoutes(req,res,url,user) {
   requirePlatform(user);
   const path=url.pathname,method=req.method;
   if (method==='GET' && path==='/api/platform/overview') {
-    const merchants=db.prepare('SELECT id,slug,name,active,created_at FROM merchants ORDER BY created_at DESC').all();
+    const merchants=db.prepare(`SELECT m.id,m.slug,m.name,m.active,m.created_at,
+      EXISTS(SELECT 1 FROM users u WHERE u.merchant_id=m.id AND u.role='owner') AS has_owner
+      FROM merchants m ORDER BY m.created_at DESC`).all().map(row=>({...row,has_owner:row.has_owner?1:0}));
     const applications=db.prepare("SELECT status,COUNT(*) AS count FROM merchant_applications GROUP BY status").all();
     return json(res,200,{merchants,applications});
   }
@@ -357,8 +371,9 @@ async function merchantRoutes(req,res,url,user) {
   const mid=merchantOf(user),path=url.pathname,method=req.method;
   if (method==='GET'&&path==='/api/admin/dashboard') {
     const totals=db.prepare('SELECT status,COUNT(*) AS count FROM bookings WHERE merchant_id=? GROUP BY status').all(mid);
-    const recent=db.prepare(`SELECT b.id,b.code,b.preferred_date,b.preferred_time,b.status,b.created_at,s.title AS service_title
-      FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.merchant_id=? ORDER BY b.created_at DESC LIMIT 8`).all(mid);
+    const recent=db.prepare(`SELECT b.id,b.code,b.contact_name,b.preferred_date,b.preferred_time,b.status,b.created_at,
+      s.title AS service_title,b.package_title_snapshot AS package_title
+      FROM bookings b JOIN services s ON s.id=b.service_id WHERE b.merchant_id=? ORDER BY b.created_at DESC, b.rowid DESC LIMIT 8`).all(mid);
     return json(res,200,{totals,recent});
   }
   if (method==='GET'&&path==='/api/admin/bookings') {
@@ -370,18 +385,27 @@ async function merchantRoutes(req,res,url,user) {
     const total=db.prepare('SELECT COUNT(*) AS n FROM bookings b'+where).get(...params).n;
     const items=db.prepare(`SELECT b.id,b.code,b.contact_name,b.contact_phone,b.preferred_date,b.preferred_time,
       b.duration_minutes,b.note,b.status,b.created_at,b.updated_at,s.title AS service_title,b.package_title_snapshot AS package_title,b.package_price_cents
-      FROM bookings b JOIN services s ON s.id=b.service_id ${where} ORDER BY b.created_at DESC LIMIT 20 OFFSET ?`)
+      FROM bookings b JOIN services s ON s.id=b.service_id ${where} ORDER BY b.created_at DESC, b.rowid DESC LIMIT 20 OFFSET ?`)
       .all(...params,(page-1)*20);
     for(const booking of items)booking.allocations=db.prepare(`SELECT r.id AS resource_id,r.name,r.kind,a.quantity FROM booking_allocations a JOIN resources r ON r.id=a.resource_id WHERE a.booking_id=?`).all(booking.id);
     return json(res,200,{items,total,page,pageSize:20});
   }
   let m=path.match(/^\/api\/admin\/bookings\/([\w-]+)\/resource-needs$/);
   if(method==='GET'&&m){
-    const booking=db.prepare('SELECT id,preferred_date,preferred_time,duration_minutes,buffer_before,buffer_after FROM bookings WHERE id=? AND merchant_id=?').get(m[1],mid);
+    const booking=db.prepare(`SELECT id,code,note,status,preferred_date,preferred_time,duration_minutes,buffer_before,buffer_after
+      FROM bookings WHERE id=? AND merchant_id=?`).get(m[1],mid);
     if(!booking)err(404,'预约不存在');
     const requirements=requiredResourcesForBooking(booking.id);
-    const resources=db.prepare('SELECT id,name,kind,capacity FROM resources WHERE merchant_id=? AND active=1 ORDER BY kind,name').all(mid);
-    return json(res,200,{booking,requirements,resources});
+    const closed=!!db.prepare('SELECT 1 FROM days_off WHERE merchant_id=? AND date=?').get(mid,booking.preferred_date);
+    const rows=db.prepare('SELECT id,name,kind,capacity,active FROM resources WHERE merchant_id=? AND active=1 ORDER BY kind,name').all(mid);
+    let resources;
+    try {
+      resources=rows.map(r=>({id:r.id,name:r.name,kind:r.kind,capacity:r.capacity,free:closed?0:freeAt(r,booking.preferred_date,booking,booking.id)}));
+    } catch (error) {
+      if (!error.status) throw error;
+      resources=rows.map(r=>({id:r.id,name:r.name,kind:r.kind,capacity:r.capacity,free:0}));
+    }
+    return json(res,200,{booking:{id:booking.id,code:booking.code,note:booking.note,status:booking.status,preferred_date:booking.preferred_date,preferred_time:booking.preferred_time,duration_minutes:booking.duration_minutes},requirements,resources,closed});
   }
   m=path.match(/^\/api\/admin\/bookings\/([\w-]+)\/status$/);
   if (method==='PATCH'&&m) {
@@ -433,8 +457,8 @@ async function merchantRoutes(req,res,url,user) {
     transaction(()=>{
       db.prepare('UPDATE services SET title=?,description=?,price_cents=?,duration_minutes=?,image_url=?,active=? WHERE id=? AND merchant_id=?')
         .run(title,description,price,duration,image_url,active,id,mid);
-      db.prepare(`UPDATE service_packages SET price_cents=?,duration_minutes=?,active=?
-        WHERE service_id=? AND merchant_id=? AND is_default=1`).run(price,duration,active,id,mid);
+      db.prepare(`UPDATE service_packages SET description=?,price_cents=?,duration_minutes=?,active=?
+        WHERE service_id=? AND merchant_id=? AND is_default=1`).run(description,price,duration,active,id,mid);
     });
     return json(res,200,{id});
   }
@@ -493,7 +517,7 @@ async function merchantRoutes(req,res,url,user) {
   if(method==='POST'&&path==='/api/admin/resource-blocks') {
     requireOwner(user);const data=await getBody(req),resourceId=required(data.resource_id,100),date=required(data.date,10);
     if(!dateOK(date)||date<shopDate())err(400,'不可封闭已过去的日期');
-    const start=minute(required(data.start_time,5)),end=minute(required(data.end_time,5)),reason=optional(data.reason,200);
+    const start=minute(required(data.start_time,8)),end=minute(required(data.end_time,8)),reason=optional(data.reason,200);
     if(start>=end)err(400,'结束时间必须晚于开始时间');
     transaction(()=>{
       const resource=db.prepare('SELECT id FROM resources WHERE id=? AND merchant_id=?').get(resourceId,mid);

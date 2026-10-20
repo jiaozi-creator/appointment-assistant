@@ -4,8 +4,11 @@ import { db } from './db.js';
 
 export const RESOURCE_KINDS = ['photographer','room','equipment'];
 export const minute = value => {
-  if (typeof value !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) throw Object.assign(new Error('时段格式无效'),{status:400});
-  return Number(value.slice(0,2))*60+Number(value.slice(3));
+  // Browsers submit <input type="time"> as HH:MM or HH:MM:SS. Seconds are ignored.
+  if (typeof value !== 'string') throw Object.assign(new Error('时段格式无效'),{status:400});
+  const matched=value.match(/^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+  if (!matched) throw Object.assign(new Error('时段格式无效'),{status:400});
+  return Number(matched[1])*60+Number(matched[2]);
 };
 export const fail = (status,message) => {throw Object.assign(new Error(message),{status});};
 export function requirementsOf(source) {
@@ -52,6 +55,11 @@ function freeCapacity(resource,date,start,end,ignoreBookingId='') {
   let used=0,maxUsed=0;
   for (const [,diff] of changes){used+=diff;maxUsed=Math.max(maxUsed,used);}
   return Math.max(0,resource.capacity-maxUsed);
+}
+export function freeAt(resource, date, booking, ignoreBookingId='') {
+  if (!resource?.active) return 0;
+  const {start,end}=bookingWindow(booking);
+  return freeCapacity(resource, date, start, end, ignoreBookingId);
 }
 export function allocate({merchantId,date,time,duration,before=0,after=0,requirements,requested,ignoreBookingId=''}) {
   const {start,end}=bookingWindow({preferred_time:time,duration_minutes:duration,buffer_before:before,buffer_after:after});
