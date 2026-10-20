@@ -22,3 +22,6 @@
 .assign-item input{width:74px}
 .assignment-dialog{max-height:90vh;overflow-y:auto}
 .booking-note{display:block;max-width:420px;color:#5f7266;font-size:12px;line-height:1.6;margin-top:6px;white-space:pre-wrap}
+.assignment-dialog{width:min(640px,100%)}
+.assign-item label{white-space:nowrap;flex-shrink:0}
+.assign-group h3 small{font-weight:500}
