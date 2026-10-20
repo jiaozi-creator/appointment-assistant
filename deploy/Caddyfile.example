@@ -1,0 +1,11 @@
+# Example only. Replace with your real domain; configure DNS and firewall first.
+appointment.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3001
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+}

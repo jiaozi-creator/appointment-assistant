@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: appointment
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set the database password}
+      POSTGRES_DB: appointment
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appointment -d appointment"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  appointment:
+    build: ..
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATABASE_URL: postgres://appointment:${POSTGRES_PASSWORD}@postgres:5432/appointment
+      COOKIE_SECURE: "1"
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:?Set HTTPS allowed origin}
+      INIT_PLATFORM_EMAIL: ${INIT_PLATFORM_EMAIL:?Set first platform email}
+      INIT_PLATFORM_PASSWORD: ${INIT_PLATFORM_PASSWORD:?Set long first platform password}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMS_ACCESS_KEY_ID: ${SMS_ACCESS_KEY_ID:-}
+      SMS_ACCESS_KEY_SECRET: ${SMS_ACCESS_KEY_SECRET:-}
+      SMS_SIGN_NAME: ${SMS_SIGN_NAME:-}
+      SMS_TEMPLATE_CODE: ${SMS_TEMPLATE_CODE:-}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-test}
+      WECHAT_MCH_ID: ${WECHAT_MCH_ID:-}
+      WECHAT_APP_ID: ${WECHAT_APP_ID:-}
+      WECHAT_CERT_SERIAL: ${WECHAT_CERT_SERIAL:-}
+      WECHAT_PRIVATE_KEY: ${WECHAT_PRIVATE_KEY:-}
+      WECHAT_NOTIFY_URL: ${WECHAT_NOTIFY_URL:-}
+    ports:
+      - "127.0.0.1:3001:3001"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+volumes:
+  postgres_data:
