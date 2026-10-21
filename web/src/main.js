@@ -2,6 +2,7 @@ import { createApp } from 'vue';
 import { createRouter,createWebHistory } from 'vue-router';
 import App from './App.vue';
 import './style.css';
+import './customer.css';
 const router=createRouter({history:createWebHistory(),routes:[
 {path:'/',redirect:'/s/forest-photo'},
 {path:'/s/:slug',component:()=>import('./pages/Shop.vue')},

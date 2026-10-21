@@ -1,8 +1,65 @@
 <script setup>
-import { ref,onMounted } from 'vue';import { useRoute,useRouter } from 'vue-router';import { api,money } from '../api';
-const route=useRoute(),router=useRouter(),shop=ref(null),services=ref([]),error=ref(''),loading=ref(true),lookupCode=ref(''),lookupError=ref('');
-onMounted(async()=>{try{const slug=route.params.slug;[shop.value,{items:services.value}]=await Promise.all([api('/public/shops/'+slug),api('/public/shops/'+slug+'/services')]);shop.value=shop.value.merchant}catch(e){error.value=e.message}finally{loading.value=false}});
-const book=s=>router.push(`/s/${route.params.slug}/book/${s.id}`);
-function lookup(){lookupError.value='';const code=lookupCode.value.trim().toUpperCase();if(!/^YK[A-Z0-9]{10,32}$/.test(code)){lookupError.value='请输入完整预约编号，例如 YK 开头的一串编号';return;}router.push({path:`/s/${route.params.slug}/success`,query:{code}});}
+import { ref, onMounted } from 'vue';
+import { useRoute } from 'vue-router';
+import { api, money } from '../api';
+import CustomerFrame from '../components/CustomerFrame.vue';
+
+const route = useRoute();
+const shop = ref(null);
+const services = ref([]);
+const error = ref('');
+const loading = ref(true);
+
+async function load() {
+  loading.value = true;
+  error.value = '';
+  try {
+    const slug = route.params.slug;
+    const [studio, catalog] = await Promise.all([
+      api('/public/shops/' + slug),
+      api('/public/shops/' + slug + '/services')
+    ]);
+    shop.value = studio.merchant;
+    services.value = catalog.items;
+  } catch (e) {
+    shop.value = null;
+    error.value = e.message;
+  } finally {
+    loading.value = false;
+  }
+}
+
+onMounted(load);
 </script>
-<template><div class="shop-shell"><header class="shop-header wrap"><div class="brand"><span class="brand-icon">◈</span><span>约客助手 <small>APPOINTMENT STUDIO</small></span></div><a href="/login" class="subtle-link">商家入口 ↗</a></header><main v-if="shop"><section class="hero"><div class="wrap hero-inner"><div class="eyebrow">YOUR MOMENTS, BEAUTIFULLY KEPT</div><h1>{{shop.name}}</h1><p>{{shop.intro}}</p><p v-if="shop.time_zone" class="hero-note">档期按 {{shop.time_zone_label||shop.time_zone}}（{{shop.time_zone}}）展示</p><div class="hero-action"><a href="#services" class="button primary">探索拍摄服务 <span>↗</span></a><span class="hero-note">简单预约 · 人工确认</span></div></div><div class="hero-decoration">FRAME<br/>YOUR<br/><i>STORY.</i></div></section><section class="wrap public-section" id="services"><div class="section-top"><div><div class="eyebrow dark">CRAFTED FOR YOU</div><h2>探索拍摄服务<span class="dot">.</span></h2></div><p>挑选心仪的拍摄项目，<br/>让美好的故事从这里开始。</p></div><div class="service-grid"><article v-for="(s,i) in services" :key="s.id" class="service-card"><div class="service-cover" :class="'tone-'+i%3"><img v-if="s.image_url" :src="s.image_url" alt="服务图片"/><div v-else class="placeholder-art"><span>0{{i+1}}</span><div class="art-ring"></div><b>YOUR<br/>STORY</b></div></div><div class="service-content"><div class="service-title"><h3>{{s.title}}</h3><span>{{money(s.price_cents)}} 起</span></div><p>{{s.description}}</p><div class="service-footer"><span>◷ 约 {{s.duration_minutes}} 分钟</span><button class="round-arrow" :aria-label="'预约'+s.title" @click="book(s)">↗</button></div></div></article></div><div v-if="!services.length" class="empty">商家暂未上架拍摄服务</div></section><section class="wrap public-section" id="lookup"><div class="section-top"><div><div class="eyebrow dark">TRACK A REQUEST</div><h2>查询预约进度<span class="dot">.</span></h2></div><p>提交成功后请保存预约编号。<br/>这里只能查看进度，不会显示电话和姓名。</p></div><form class="filter-row" @submit.prevent="lookup"><input v-model.trim="lookupCode" maxlength="40" placeholder="输入预约编号" required/><button class="button dark" type="submit">查询进度</button></form><p v-if="lookupError" class="alert">{{lookupError}}</p></section><section class="about-band"><div class="wrap about-inner"><div><div class="eyebrow">A LITTLE ABOUT US</div><h2>每一份美好，<br/>都值得用心记录。</h2></div><p>选择你喜欢的拍摄项目，填写预约意向。工作室将在核对档期后与你联系确认，提交申请不代表预约已确认。</p></div></section></main><div v-else class="center-state">{{loading?'正在加载工作室…':error}}</div><footer class="wrap foot"><span>© 2026 约客助手 · 预约管理服务</span><span>{{shop?.address||'为每一次相遇而设计'}}</span></footer></div></template>
+
+<template>
+  <CustomerFrame tab="book">
+    <template #end>
+      <router-link to="/login" class="c-quiet">商家入口</router-link>
+    </template>
+    <template v-if="shop">
+      <h1 class="c-display">{{ shop.name }}</h1>
+      <p v-if="shop.intro" class="c-lead">{{ shop.intro }}</p>
+      <p v-if="shop.address" class="c-note">{{ shop.address }}</p>
+      <p v-if="shop.time_zone" class="c-note">档期按 {{ shop.time_zone_label || shop.time_zone }}（{{ shop.time_zone }}）展示</p>
+      <div v-if="services.length" class="c-list">
+        <router-link v-for="s in services" :key="s.id" class="c-row" :to="`/s/${route.params.slug}/book/${s.id}`">
+          <span>
+            <strong>{{ s.title }}</strong>
+            <small v-if="s.description">{{ s.description }}</small>
+            <small>约 {{ s.duration_minutes }} 分钟</small>
+          </span>
+          <span class="c-price">{{ money(s.price_cents) }} 起</span>
+        </router-link>
+      </div>
+      <div v-else class="c-empty is-section">
+        <p>这家工作室暂时没有可预约的项目。</p>
+        <router-link class="c-btn" :to="`/s/${route.params.slug}/success`">查看进度</router-link>
+      </div>
+    </template>
+    <div v-else class="c-empty">
+      <p>{{ loading ? '正在打开工作室。' : error }}</p>
+      <button v-if="!loading && error" class="c-btn" type="button" @click="load">重试</button>
+    </div>
+  </CustomerFrame>
+</template>
