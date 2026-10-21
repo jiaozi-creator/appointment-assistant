@@ -1,10 +1,13 @@
 <script setup>
-import { ref, onMounted } from 'vue';
-import { useRoute } from 'vue-router';
+import { ref, computed, onMounted, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { api, send, money } from '../api';
+import CustomerFrame from '../components/CustomerFrame.vue';
+
 const route = useRoute();
-const names = { pending:'待商家确认', confirmed:'商家已确认', completed:'已完成', cancelled:'已取消', rejected:'未接受' };
-const payNames = { unpaid:'待支付', paid:'已支付', refunded:'已退款' };
+const router = useRouter();
+const names = { pending: '待商家确认', confirmed: '商家已确认', completed: '已完成', cancelled: '已取消', rejected: '未接受' };
+const payNames = { unpaid: '待支付', paid: '已支付', refunded: '已退款' };
 let cached = null;
 try { cached = JSON.parse(sessionStorage.getItem('last-booking') || 'null'); } catch { /* ignore broken session cache */ }
 const result = ref(cached && (!route.query.code || cached.code === route.query.code) ? cached : null);
@@ -13,6 +16,10 @@ const notice = ref('');
 const loading = ref(false);
 const acting = ref(false);
 const phone = ref('');
+const lookupCode = ref(String(route.query.code || ''));
+const lookupOpen = ref(false);
+const showReceipt = computed(() => result.value && !lookupOpen.value);
+
 function applyBooking(booking) {
   result.value = {
     code: booking.code,
@@ -26,6 +33,7 @@ function applyBooking(booking) {
     time_zone_label: booking.time_zone_label || booking.time_zone
   };
 }
+
 async function refresh() {
   const code = String(route.query.code || result.value?.code || '').trim();
   if (!code) return;
@@ -34,14 +42,34 @@ async function refresh() {
   try {
     const data = await api(`/public/shops/${route.params.slug}/bookings/${encodeURIComponent(code)}`);
     applyBooking(data.booking);
+    lookupOpen.value = false;
   } catch (e) {
     if (!result.value) error.value = e.message;
     else error.value = `暂时无法刷新进度：${e.message}`;
   } finally { loading.value = false; }
 }
+
+async function lookup() {
+  error.value = '';
+  const code = lookupCode.value.trim().toUpperCase();
+  if (!/^YK[A-Z0-9]{10,32}$/.test(code)) {
+    error.value = '请输入完整预约编号，例如 YK 开头的一串编号';
+    return;
+  }
+  lookupCode.value = code;
+  if (String(route.query.code || '') === code) {
+    lookupOpen.value = false;
+    await refresh();
+    return;
+  }
+  await router.push({ path: `/s/${route.params.slug}/success`, query: { code } });
+}
+
 async function pay() {
   if (!result.value || acting.value) return;
-  acting.value = true; error.value = ''; notice.value = '';
+  acting.value = true;
+  error.value = '';
+  notice.value = '';
   try {
     const data = await send(`/public/shops/${route.params.slug}/bookings/${encodeURIComponent(result.value.code)}/pay`, { contact_phone: phone.value });
     if (data.code_url) notice.value = `请用微信扫码支付：${data.code_url}。支付后再次点击查询支付结果。`;
@@ -50,10 +78,13 @@ async function pay() {
   } catch (e) { error.value = e.message; }
   finally { acting.value = false; }
 }
+
 async function cancelBooking() {
   if (!result.value || acting.value) return;
   if (!confirm('确定取消这笔预约吗？已确认的档期会释放；已支付的金额会退回。')) return;
-  acting.value = true; error.value = ''; notice.value = '';
+  acting.value = true;
+  error.value = '';
+  notice.value = '';
   try {
     const data = await send(`/public/shops/${route.params.slug}/bookings/${encodeURIComponent(result.value.code)}/cancel`, { contact_phone: phone.value });
     notice.value = data.payment_status === 'refunded' ? '预约已取消，款项已退回。' : '预约已取消。';
@@ -61,31 +92,56 @@ async function cancelBooking() {
   } catch (e) { error.value = e.message; }
   finally { acting.value = false; }
 }
+
 onMounted(refresh);
+watch(() => route.query.code, code => {
+  if (!code) return;
+  lookupCode.value = String(code);
+  refresh();
+});
 </script>
+
 <template>
-  <div class="success-page"><div class="success-card"><div class="success-mark">✓</div><div class="eyebrow dark">REQUEST RECEIVED</div><h1>预约进度</h1>
-    <p v-if="result">请保存预约编号。刷新后仍可查询。查询不会显示电话、邮箱或姓名，支付和取消时需要重新填写预约时使用的电话。</p>
-    <p v-else>输入过的预约编号可以在工作室主页再次查询。当前页面没有可展示的回执。</p>
-    <div v-if="result" class="receipt">
-      <div><span>预约编号</span><strong>{{result.code}}</strong></div>
-      <div><span>拍摄服务</span><strong>{{result.title}}</strong></div>
-      <div><span>意向时间</span><strong>{{result.date}} · {{result.time}}</strong></div>
-      <div><span>时区</span><strong>{{result.time_zone_label||'工作室时区'}}（{{result.time_zone||'—'}}）</strong></div>
-      <div><span>状态</span><strong>{{names[result.status]||result.status||'待商家确认'}}</strong></div>
-      <div><span>支付</span><strong>{{payNames[result.payment_status]||result.payment_status||'待支付'}}<template v-if="result.price"> · {{money(result.price)}}</template></strong></div>
-    </div>
-    <div v-if="result && (result.status==='pending' || result.status==='confirmed')" class="form-section">
-      <label>预约电话<input v-model.trim="phone" maxlength="25" inputmode="tel" autocomplete="tel" placeholder="与提交预约时相同"/></label>
-      <div class="resource-actions">
-        <button v-if="result.payment_status==='unpaid'" class="button primary" type="button" :disabled="acting" @click="pay">{{acting?'处理中…':'完成支付'}}</button>
-        <button class="outline-action" type="button" :disabled="acting" @click="cancelBooking">取消预约</button>
+  <CustomerFrame tab="progress">
+    <template v-if="showReceipt">
+      <h1 class="c-display">预约进度</h1>
+      <p class="c-lead">请保存预约编号。刷新后仍可查询。查询不会显示电话、邮箱或姓名，支付和取消时需要重新填写预约时使用的电话。</p>
+      <dl class="c-spec">
+        <div><dt>预约编号</dt><dd>{{ result.code }}</dd></div>
+        <div><dt>拍摄服务</dt><dd>{{ result.title }}</dd></div>
+        <div><dt>意向时间</dt><dd>{{ result.date }} · {{ result.time }}</dd></div>
+        <div><dt>时区</dt><dd>{{ result.time_zone_label || '工作室时区' }}（{{ result.time_zone || '—' }}）</dd></div>
+        <div><dt>状态</dt><dd>{{ names[result.status] || result.status || '待商家确认' }}</dd></div>
+        <div><dt>支付</dt><dd>{{ payNames[result.payment_status] || result.payment_status || '待支付' }}<template v-if="result.price"> · {{ money(result.price) }}</template></dd></div>
+      </dl>
+      <div v-if="result.status === 'pending' || result.status === 'confirmed'" class="c-stack">
+        <label class="c-field">预约电话
+          <input v-model.trim="phone" maxlength="25" inputmode="tel" autocomplete="tel" placeholder="与提交预约时相同" />
+        </label>
+        <button v-if="result.payment_status === 'unpaid'" class="c-btn" type="button" :disabled="acting" @click="pay">{{ acting ? '处理中…' : '完成支付' }}</button>
+        <button class="c-btn alt" type="button" :disabled="acting" @click="cancelBooking">取消预约</button>
+        <p class="c-note">取消规则：待确认或已确认可以取消。未支付直接取消；已支付会退款并记为已退款。已确认取消后释放摄影师、场地和设备。已完成、已拒绝、已取消不能再取消。取消后会发送邮件和短信。</p>
       </div>
-      <p class="tiny">取消规则：待确认或已确认可以取消。未支付直接取消；已支付会退款并记为已退款。已确认取消后释放摄影师、场地和设备。已完成、已拒绝、已取消不能再取消。取消后会发送邮件和短信。</p>
+      <p v-if="notice" class="c-note">{{ notice }}</p>
+      <p v-if="error" class="c-alert" role="alert">{{ error }}</p>
+      <div class="c-stack">
+        <button class="c-btn alt" type="button" :disabled="loading" @click="refresh">{{ loading ? '正在刷新…' : '刷新进度' }}</button>
+        <button class="c-text" type="button" @click="lookupOpen = true; lookupCode = ''">查询其他编号</button>
+      </div>
+      <p class="c-note">查询只返回预约状态、支付状态和时区，不显示联系电话和姓名。</p>
+    </template>
+    <div v-else-if="loading && route.query.code" class="c-empty">
+      <p>正在查询预约。</p>
     </div>
-    <p v-if="notice" class="hint">{{notice}}</p>
-    <p v-if="error" class="alert">{{error}}</p>
-    <div class="resource-actions" style="justify-content:center"><button v-if="result" class="outline-action" type="button" :disabled="loading" @click="refresh">{{loading?'正在刷新…':'刷新进度'}}</button><router-link class="button primary" :to="`/s/${route.params.slug}`">返回工作室主页 ↗</router-link></div>
-    <p class="tiny">查询只返回预约状态、支付状态和时区，不显示联系电话和姓名。</p>
-  </div></div>
+    <div v-else class="c-empty">
+      <p>输入预约编号查看进度，这里不显示电话和姓名。</p>
+      <form class="c-stack" @submit.prevent="lookup">
+        <label class="c-field">预约编号
+          <input v-model.trim="lookupCode" maxlength="40" autocomplete="off" placeholder="YK 开头的编号" required />
+        </label>
+        <p v-if="error" class="c-alert" role="alert">{{ error }}</p>
+        <button class="c-btn" type="submit">查询</button>
+      </form>
+    </div>
+  </CustomerFrame>
 </template>
