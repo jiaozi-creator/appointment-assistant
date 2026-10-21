@@ -32,13 +32,22 @@
 .customer select,
 .customer textarea {
   font-family: inherit;
-  color: inherit;
   border-radius: var(--radius);
 }
 
 .c-scroll {
   flex: 1;
   overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-line) transparent;
+}
+
+.c-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+
+.c-scroll::-webkit-scrollbar-thumb {
+  background: var(--c-line);
 }
 
 .c-column {
@@ -114,7 +123,7 @@
 .c-row,
 .c-choice {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
   width: 100%;
@@ -145,6 +154,7 @@
 
 .c-price {
   flex: none;
+  padding-top: 2px;
   font-size: var(--text-sm);
 }
 
@@ -152,6 +162,7 @@
   width: 8px;
   height: 8px;
   flex: none;
+  margin-top: 8px;
   background: var(--c-btn);
   border-radius: var(--radius);
 }
@@ -281,7 +292,7 @@
   margin-top: 28px;
 }
 
-.c-btn {
+.customer .c-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -298,13 +309,13 @@
   box-shadow: none;
 }
 
-.c-btn.alt {
+.customer .c-btn.alt {
   background: transparent;
   color: var(--c-ink);
   border: 1px solid var(--c-ink);
 }
 
-.c-btn:disabled {
+.customer .c-btn:disabled {
   opacity: 0.35;
 }
 
